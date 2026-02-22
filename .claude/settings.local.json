@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh auth:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.waveshare.com)",
+      "WebFetch(domain:www.waveshare.net)",
+      "WebFetch(domain:www.waveshare.com)",
+      "WebFetch(domain:community.home-assistant.io)",
+      "WebFetch(domain:files.waveshare.com)",
+      "WebFetch(domain:www.good-display.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(cmd.exe:*)",
+      "WebFetch(domain:components.espressif.com)"
+    ]
+  }
+}
