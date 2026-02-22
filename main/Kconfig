@@ -1,0 +1,14 @@
+# Main component configuration
+menu "Clock / WiFi Configuration"
+    config WIFI_SSID
+        string "WiFi SSID"
+        default "your_ssid"
+        help
+            SSID of the WiFi AP to connect to for NTP.
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default "your_password"
+        help
+            Password of the WiFi AP.
+endmenu

@@ -44,3 +44,14 @@ idf.py menuconfig
 idf.py build
 idf.py flash monitor
 ```
+
+### Clock (WiFi + NTP)
+
+The clock shows “Hello Kyle, its Sunday, February 22nd” and the time in `HH:MM:SS` with seconds updating every second. To get real time:
+
+1. Run `idf.py menuconfig`.
+2. Open **“Clock / WiFi Configuration”**.
+3. Set **WiFi SSID** and **WiFi Password** to your network.
+4. Build and flash.
+
+Time is synced from NTP (pool.ntp.org). The default timezone is US Central (`CST6CDT`). To change it, edit the `setenv("TZ", ...)` line in `main/main.cpp` (e.g. `PST8PDT` for Pacific, `EST5EDT` for Eastern).
