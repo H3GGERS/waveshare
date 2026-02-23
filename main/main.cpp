@@ -21,6 +21,8 @@
 #include "lvgl_bsp.h"
 #include "lvgl.h"
 
+extern const lv_font_t Inter_24pt_Bold;
+
 static const char *TAG = "main";
 
 // Pin assignments for Waveshare ESP32-S3-RLCD-4.2 (300×400 landscape)
@@ -38,8 +40,9 @@ static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static const int WIFI_MAX_RETRY = 10;
 
-static lv_obj_t *s_date_label = NULL;
-static lv_obj_t *s_time_label = NULL;
+static lv_obj_t *s_greeting_label = NULL;  // "Hello Kyle"
+static lv_obj_t *s_date_label = NULL;      // "Its Sunday, February 22nd"
+static lv_obj_t *s_time_label = NULL;      // "01:03:13 PM"
 
 static const char *const WEEKDAY[] = {
     "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
@@ -126,7 +129,7 @@ static void init_time(void)
             break;
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    setenv("TZ", "CST6CDT,M3.2.0,M11.1.0", 1);  // Central (adjust for your timezone)
+    setenv("TZ", "MST7MDT,M3.2.0,M11.1.0", 1);  // US Mountain
     tzset();
 }
 
@@ -157,12 +160,15 @@ static void update_clock_cb(void *arg)
     char date_buf[64];
     char suffix[4];
     ordinal_suffix(tm.tm_mday, suffix, sizeof(suffix));
-    snprintf(date_buf, sizeof(date_buf), "Hello Kyle, its %s, %s %d%s",
+    snprintf(date_buf, sizeof(date_buf), "Its %s, %s %d%s",
              WEEKDAY[tm.tm_wday], MONTH[tm.tm_mon], tm.tm_mday, suffix);
 
-    char time_buf[16];
-    snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d",
-             tm.tm_hour, tm.tm_min, tm.tm_sec);
+    int h12 = tm.tm_hour % 12;
+    if (h12 == 0) h12 = 12;
+    const char *ampm = (tm.tm_hour < 12) ? "AM" : "PM";
+    char time_buf[20];
+    snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d %s",
+             h12, tm.tm_min, tm.tm_sec, ampm);
 
     if (Lvgl_lock(50)) {
         if (s_date_label)
@@ -191,7 +197,7 @@ extern "C" void app_main(void)
         time_t t = 1730000000;  // fallback: set a fixed time so clock still runs
         struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
         settimeofday(&tv, NULL);
-        setenv("TZ", "CST6CDT,M3.2.0,M11.1.0", 1);
+        setenv("TZ", "MST7MDT,M3.2.0,M11.1.0", 1);
         tzset();
     }
 
@@ -201,15 +207,45 @@ extern "C" void app_main(void)
     if (Lvgl_lock(-1)) {
         lv_obj_t *screen = lv_screen_active();
 
+        // Figma layout: 24pt Bold Inter for greeting/date, separator line, then time
+        const int PADDING_LEFT = 24;
+        const int PADDING_TOP = 24;
+        const int PADDING_BOTTOM = 24;     // match bottom padding so time centers in content area
+        const int LINE_HEIGHT_INTER = 29;   // Inter 24pt Bold line height
+        const int GAP_AFTER_DATE = 16;     // space between date and line
+        const int GAP_AFTER_LINE = 32;     // space between line and time
+
+        s_greeting_label = lv_label_create(screen);
+        lv_label_set_text(s_greeting_label, "Hello Kyle");
+        lv_obj_set_style_text_font(s_greeting_label, &Inter_24pt_Bold, 0);
+        lv_obj_align(s_greeting_label, LV_ALIGN_TOP_LEFT, PADDING_LEFT, PADDING_TOP);
+
         s_date_label = lv_label_create(screen);
-        lv_label_set_text(s_date_label, "Hello Kyle, its ...");
-        lv_obj_set_style_text_font(s_date_label, &lv_font_montserrat_14, 0);
-        lv_obj_align(s_date_label, LV_ALIGN_TOP_MID, 0, 24);
+        lv_label_set_text(s_date_label, "Its ...");
+        lv_obj_set_style_text_font(s_date_label, &Inter_24pt_Bold, 0);
+        lv_obj_align(s_date_label, LV_ALIGN_TOP_LEFT, PADDING_LEFT, PADDING_TOP + LINE_HEIGHT_INTER);
+
+        // Divider from Figma SVG: 350×5 black bar (right end chamfered in design)
+        const int DIVIDER_WIDTH = 350;
+        const int DIVIDER_HEIGHT = 5;
+        int line_y = PADDING_TOP + LINE_HEIGHT_INTER * 2 + GAP_AFTER_DATE;
+        lv_obj_t *line = lv_obj_create(screen);
+        lv_obj_set_size(line, DIVIDER_WIDTH, DIVIDER_HEIGHT);
+        lv_obj_align(line, LV_ALIGN_TOP_LEFT, PADDING_LEFT, line_y);
+        lv_obj_set_style_bg_color(line, lv_color_black(), 0);
+        lv_obj_set_style_radius(line, 0, 0);
+        lv_obj_set_style_pad_all(line, 0, 0);
+        lv_obj_set_style_border_width(line, 0, 0);
 
         s_time_label = lv_label_create(screen);
-        lv_label_set_text(s_time_label, "00:00:00");
-        lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_24, 0);
-        lv_obj_align(s_time_label, LV_ALIGN_CENTER, 0, 24);
+        lv_label_set_text(s_time_label, "12:00:00 PM");
+        lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_48, 0);
+        // Center time vertically between divider+gap and bottom padding (equal space above/below)
+        int time_region_top = line_y + DIVIDER_HEIGHT + GAP_AFTER_LINE;
+        int time_region_bottom = LCD_HEIGHT - PADDING_BOTTOM;
+        int time_region_center_y = (time_region_top + time_region_bottom) / 2;
+        int time_offset_y = time_region_center_y - LCD_HEIGHT / 2;
+        lv_obj_align(s_time_label, LV_ALIGN_CENTER, 0, time_offset_y);
 
         Lvgl_unlock();
     }
