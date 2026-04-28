@@ -33,6 +33,7 @@
 #include "lvgl.h"
 
 extern const lv_font_t Inter_24pt_Bold;
+extern const lv_font_t NotoSansSymbols2_24 __attribute__((weak));
 
 static const char *TAG = "main";
 
@@ -59,8 +60,11 @@ static int s_retry_num = 0;
 static lv_obj_t *s_date_label = NULL;
 static lv_obj_t *s_time_label = NULL;
 static lv_obj_t *s_status_label = NULL;
+static lv_obj_t *s_game_value_label = NULL;
+static lv_obj_t *s_last_move_value_label = NULL;
+static lv_obj_t *s_advantage_value_label = NULL;
 static lv_obj_t *s_square_obj[8][8] = {};
-static lv_obj_t *s_piece_layer[8][8] = {};
+static lv_obj_t *s_piece_label[8][8] = {};
 
 struct LastMove {
     bool valid = false;
@@ -90,6 +94,9 @@ struct ChessState {
     BoardState board = {};
     bool board_valid = false;
     std::string status_text = "Loading...";
+    std::string game_text = "";
+    std::string last_move_text = "";
+    std::string advantage_text = "Unknown";
 };
 
 static ChessState s_chess_state;
@@ -219,7 +226,7 @@ static void update_clock_cb(void *arg)
     }
     const char *ampm = (tm.tm_hour < 12) ? "AM" : "PM";
     char time_buf[16];
-    snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d %s", h12, tm.tm_min, tm.tm_sec, ampm);
+    snprintf(time_buf, sizeof(time_buf), "%d:%02d %s", h12, tm.tm_min, ampm);
 
     if (Lvgl_lock(50)) {
         if (s_date_label) {
@@ -251,13 +258,30 @@ static bool http_get_string(const std::string &url, std::string &out_body)
     cfg.event_handler = http_event_handler;
     cfg.user_data = &out_body;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.user_agent = "waveshare-esp32s3/1.0";
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
+        ESP_LOGE(TAG, "http_get_string: client init failed for %s", url.c_str());
         return false;
     }
+    esp_http_client_set_header(client, "Accept", "application/json");
+    esp_http_client_set_header(client, "Accept-Encoding", "identity");
+
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
+    int64_t content_length = esp_http_client_get_content_length(client);
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGE(TAG, "HTTP GET failed: url=%s err=%s status=%d len=%lld body_bytes=%u",
+                 url.c_str(), esp_err_to_name(err), status, (long long)content_length,
+                 (unsigned int)out_body.size());
+        if (!out_body.empty()) {
+            size_t preview = out_body.size() > 180 ? 180 : out_body.size();
+            ESP_LOGW(TAG, "HTTP body preview: %.*s", (int)preview, out_body.c_str());
+        }
+    } else {
+        ESP_LOGI(TAG, "HTTP GET ok: url=%s len=%u", url.c_str(), (unsigned int)out_body.size());
+    }
     esp_http_client_cleanup(client);
     return (err == ESP_OK && status == 200);
 }
@@ -314,28 +338,112 @@ static bool extract_last_move_from_pgn(const std::string &pgn, LastMove &out)
     return out.valid;
 }
 
+static std::string extract_last_san_from_pgn(const std::string &pgn)
+{
+    size_t body_pos = pgn.find("\n\n");
+    std::string moves = (body_pos == std::string::npos) ? pgn : pgn.substr(body_pos + 2);
+    std::string token;
+    std::string last_san;
+
+    for (char ch : moves) {
+        if (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t') {
+            if (token.empty()) {
+                continue;
+            }
+            bool is_move_number = false;
+            size_t dot_pos = token.find('.');
+            if (dot_pos != std::string::npos) {
+                is_move_number = true;
+                for (size_t i = 0; i < dot_pos; ++i) {
+                    if (!std::isdigit((unsigned char)token[i])) {
+                        is_move_number = false;
+                        break;
+                    }
+                }
+            }
+            if (!is_move_number &&
+                token != "1-0" && token != "0-1" && token != "1/2-1/2" && token != "*") {
+                last_san = token;
+            }
+            token.clear();
+            continue;
+        }
+        token.push_back(ch);
+    }
+
+    if (!token.empty() &&
+        token != "1-0" && token != "0-1" && token != "1/2-1/2" && token != "*") {
+        last_san = token;
+    }
+    return last_san;
+}
+
 static std::string safe_json_string(cJSON *obj, const char *key)
 {
     cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, key);
     return cJSON_IsString(v) && v->valuestring ? std::string(v->valuestring) : std::string();
 }
 
+static std::string extract_username_from_url(const std::string &url)
+{
+    size_t pos = url.find_last_of('/');
+    if (pos == std::string::npos || pos + 1 >= url.size()) {
+        return url;
+    }
+    return url.substr(pos + 1);
+}
+
+static cJSON *parse_games_root_from_body(const std::string &body)
+{
+    cJSON *root = cJSON_Parse(body.c_str());
+    if (root) {
+        cJSON *arr = cJSON_GetObjectItemCaseSensitive(root, "games");
+        if (cJSON_IsArray(arr)) {
+            return root;
+        }
+        cJSON_Delete(root);
+    }
+
+    // Some Chess.com responses can include a prefixed advisory JSON object.
+    size_t games_pos = body.find("{\"games\":");
+    if (games_pos == std::string::npos) {
+        return NULL;
+    }
+    std::string tail = body.substr(games_pos);
+    return cJSON_Parse(tail.c_str());
+}
+
 static bool fetch_daily_games(std::vector<ChessGameSummary> &games)
 {
     games.clear();
     std::string body;
-    std::string url = "https://api.chess.com/pub/player/" + std::string(CONFIG_CHESS_USERNAME) + "/games";
+    std::string username = CONFIG_CHESS_USERNAME;
+    for (char &ch : username) {
+        ch = (char)std::tolower((unsigned char)ch);
+    }
+    std::string url = "https://api.chess.com/pub/player/" + username + "/games";
     if (!http_get_string(url, body)) {
+        ESP_LOGE(TAG, "Failed to fetch games from Chess.com endpoint");
         return false;
     }
 
-    cJSON *root = cJSON_Parse(body.c_str());
+    cJSON *root = parse_games_root_from_body(body);
     if (!root) {
+        const char *json_err = cJSON_GetErrorPtr();
+        ESP_LOGE(TAG, "Chess.com JSON parse failed near: %s", json_err ? json_err : "(unknown)");
+        size_t preview = body.size() > 200 ? 200 : body.size();
+        ESP_LOGW(TAG, "JSON preview: %.*s", (int)preview, body.c_str());
         return false;
     }
 
     cJSON *arr = cJSON_GetObjectItemCaseSensitive(root, "games");
     if (!cJSON_IsArray(arr)) {
+        std::string code = safe_json_string(root, "code");
+        std::string message = safe_json_string(root, "message");
+        ESP_LOGE(TAG, "Chess.com payload missing 'games' array (code=%s message=%s)",
+                 code.c_str(), message.c_str());
+        size_t preview = body.size() > 220 ? 220 : body.size();
+        ESP_LOGW(TAG, "Payload preview: %.*s", (int)preview, body.c_str());
         cJSON_Delete(root);
         return false;
     }
@@ -355,11 +463,21 @@ static bool fetch_daily_games(std::vector<ChessGameSummary> &games)
 
         cJSON *white = cJSON_GetObjectItemCaseSensitive(game, "white");
         cJSON *black = cJSON_GetObjectItemCaseSensitive(game, "black");
-        if (white) {
+        if (cJSON_IsObject(white)) {
             g.white = safe_json_string(white, "username");
+        } else if (cJSON_IsString(white) && white->valuestring) {
+            g.white = extract_username_from_url(white->valuestring);
         }
-        if (black) {
+        if (cJSON_IsObject(black)) {
             g.black = safe_json_string(black, "username");
+        } else if (cJSON_IsString(black) && black->valuestring) {
+            g.black = extract_username_from_url(black->valuestring);
+        }
+        if (g.white.empty()) {
+            g.white = "White";
+        }
+        if (g.black.empty()) {
+            g.black = "Black";
         }
         if (!g.url.empty() && !g.fen.empty()) {
             games.push_back(g);
@@ -367,6 +485,7 @@ static bool fetch_daily_games(std::vector<ChessGameSummary> &games)
     }
 
     cJSON_Delete(root);
+    ESP_LOGI(TAG, "Parsed %u daily games", (unsigned int)games.size());
     return true;
 }
 
@@ -403,71 +522,81 @@ static void save_selected_url_to_nvs(const std::string &url)
     nvs_close(handle);
 }
 
-static void draw_rect(lv_obj_t *parent, int x, int y, int w, int h, lv_color_t color)
+static const char *piece_to_glyph_utf8(char piece)
 {
-    lv_obj_t *r = lv_obj_create(parent);
-    lv_obj_set_size(r, w, h);
-    lv_obj_set_pos(r, x, y);
-    lv_obj_set_style_bg_color(r, color, 0);
-    lv_obj_set_style_border_width(r, 0, 0);
-    lv_obj_set_style_radius(r, 0, 0);
-    lv_obj_set_style_pad_all(r, 0, 0);
-}
-
-static void draw_piece_bitmap(lv_obj_t *layer, char piece, int sq, bool light_square)
-{
-    if (piece == 0) {
-        return;
-    }
-    bool is_white = std::isupper((unsigned char)piece);
-    lv_color_t piece_color = is_white ? lv_color_white() : lv_color_black();
-    if ((is_white && light_square) || (!is_white && !light_square)) {
-        piece_color = light_square ? lv_color_black() : lv_color_white();
-    }
-
-    int margin = sq / 6;
-    int body_w = sq - (margin * 2);
-    int body_h = sq - (margin * 2);
-    int x = margin;
-    int y = margin;
-
-    char p = (char)std::tolower((unsigned char)piece);
-    switch (p) {
-        case 'p':
-            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 3, piece_color);
-            draw_rect(layer, x + body_w / 4, y + body_h / 3, body_w / 2, body_h / 2, piece_color);
-            break;
-        case 'n':
-            draw_rect(layer, x + body_w / 4, y + body_h / 4, body_w / 2, body_h / 2, piece_color);
-            draw_rect(layer, x + body_w / 2, y, body_w / 3, body_h / 3, piece_color);
-            break;
-        case 'b':
-            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 2, piece_color);
-            draw_rect(layer, x + body_w / 4, y + body_h / 2, body_w / 2, body_h / 3, piece_color);
-            break;
-        case 'r':
-            draw_rect(layer, x + body_w / 5, y, body_w / 5, body_h / 4, piece_color);
-            draw_rect(layer, x + body_w * 3 / 5, y, body_w / 5, body_h / 4, piece_color);
-            draw_rect(layer, x + body_w / 5, y + body_h / 4, body_w * 3 / 5, body_h / 2, piece_color);
-            break;
-        case 'q':
-            draw_rect(layer, x + body_w / 6, y + body_h / 4, body_w * 2 / 3, body_h / 2, piece_color);
-            draw_rect(layer, x + body_w / 5, y, body_w / 6, body_h / 4, piece_color);
-            draw_rect(layer, x + body_w * 2 / 5, y, body_w / 6, body_h / 4, piece_color);
-            draw_rect(layer, x + body_w * 3 / 5, y, body_w / 6, body_h / 4, piece_color);
-            break;
-        case 'k':
-            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 5, piece_color);
-            draw_rect(layer, x + body_w / 2 - 1, y - 2, 2, body_h / 3, piece_color);
-            draw_rect(layer, x + body_w / 5, y + body_h / 4, body_w * 3 / 5, body_h / 2, piece_color);
-            break;
-        default:
-            draw_rect(layer, x + body_w / 4, y + body_h / 4, body_w / 2, body_h / 2, piece_color);
-            break;
+    switch (piece) {
+        case 'K': return "\xE2\x99\x94"; // WHITE CHESS KING (U+2654)
+        case 'Q': return "\xE2\x99\x95"; // WHITE CHESS QUEEN (U+2655)
+        case 'R': return "\xE2\x99\x96"; // WHITE CHESS ROOK (U+2656)
+        case 'B': return "\xE2\x99\x97"; // WHITE CHESS BISHOP (U+2657)
+        case 'N': return "\xE2\x99\x98"; // WHITE CHESS KNIGHT (U+2658)
+        case 'P': return "\xE2\x99\x99"; // WHITE CHESS PAWN (U+2659)
+        case 'k': return "\xE2\x99\x9A"; // BLACK CHESS KING (U+265A)
+        case 'q': return "\xE2\x99\x9B"; // BLACK CHESS QUEEN (U+265B)
+        case 'r': return "\xE2\x99\x9C"; // BLACK CHESS ROOK (U+265C)
+        case 'b': return "\xE2\x99\x9D"; // BLACK CHESS BISHOP (U+265D)
+        case 'n': return "\xE2\x99\x9E"; // BLACK CHESS KNIGHT (U+265E)
+        case 'p': return "\xE2\x99\x9F"; // BLACK CHESS PAWN (U+265F)
+        default: return "";
     }
 }
 
-static void render_board_ui(const BoardState &board, bool valid, const char *status)
+static int piece_material_value(char piece)
+{
+    switch ((char)std::tolower((unsigned char)piece)) {
+        case 'p': return 1;
+        case 'n': return 3;
+        case 'b': return 3;
+        case 'r': return 5;
+        case 'q': return 9;
+        default: return 0;
+    }
+}
+
+static std::string compute_advantage_text(const BoardState &board)
+{
+    int white_score = 0;
+    int black_score = 0;
+    for (int r = 0; r < 8; ++r) {
+        for (int c = 0; c < 8; ++c) {
+            char piece = board.board[r][c];
+            if (piece == 0) {
+                continue;
+            }
+            int value = piece_material_value(piece);
+            if (std::isupper((unsigned char)piece)) {
+                white_score += value;
+            } else {
+                black_score += value;
+            }
+        }
+    }
+
+    int diff = white_score - black_score;
+    if (diff == 0) {
+        return "Equal";
+    }
+    if (diff > 0) {
+        return "White +" + std::to_string(diff);
+    }
+    return "Black +" + std::to_string(-diff);
+}
+
+static const lv_font_t *chess_piece_font()
+{
+    // If the Noto font is linked in, use it; otherwise keep rendering with Montserrat.
+    if (&NotoSansSymbols2_24) {
+        return &NotoSansSymbols2_24;
+    }
+    return &lv_font_montserrat_24;
+}
+
+static void render_board_ui(const BoardState &board,
+                            bool valid,
+                            const char *status,
+                            const char *game_text,
+                            const char *last_move_text,
+                            const char *advantage_text)
 {
     if (!Lvgl_lock(200)) {
         return;
@@ -485,15 +614,26 @@ static void render_board_ui(const BoardState &board, bool valid, const char *sta
             }
 
             lv_obj_set_style_bg_color(s_square_obj[r][c], sq_color, 0);
-            lv_obj_clean(s_piece_layer[r][c]);
             if (valid) {
-                draw_piece_bitmap(s_piece_layer[r][c], board.board[r][c], lv_obj_get_width(s_square_obj[r][c]), light);
+                lv_label_set_text(s_piece_label[r][c], piece_to_glyph_utf8(board.board[r][c]));
+            } else {
+                lv_label_set_text(s_piece_label[r][c], "");
             }
+            lv_obj_center(s_piece_label[r][c]);
         }
     }
 
     if (s_status_label) {
         lv_label_set_text(s_status_label, status ? status : "");
+    }
+    if (s_game_value_label) {
+        lv_label_set_text(s_game_value_label, game_text ? game_text : "");
+    }
+    if (s_last_move_value_label) {
+        lv_label_set_text(s_last_move_value_label, last_move_text ? last_move_text : "");
+    }
+    if (s_advantage_value_label) {
+        lv_label_set_text(s_advantage_value_label, advantage_text ? advantage_text : "");
     }
     Lvgl_unlock();
 }
@@ -501,9 +641,17 @@ static void render_board_ui(const BoardState &board, bool valid, const char *sta
 static bool refresh_chess_state(void)
 {
     std::vector<ChessGameSummary> games;
+    std::string username = CONFIG_CHESS_USERNAME;
+    std::string user_lower = username;
+    for (char &ch : user_lower) {
+        ch = (char)std::tolower((unsigned char)ch);
+    }
     if (!fetch_daily_games(games)) {
         xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
         s_chess_state.status_text = "Chess.com offline";
+        s_chess_state.game_text = "VS --";
+        s_chess_state.last_move_text = "--";
+        s_chess_state.advantage_text = "Unknown";
         xSemaphoreGive(s_chess_mutex);
         return false;
     }
@@ -520,6 +668,9 @@ static bool refresh_chess_state(void)
         xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
         s_chess_state.board_valid = false;
         s_chess_state.status_text = "No daily games";
+        s_chess_state.game_text = "VS --";
+        s_chess_state.last_move_text = "--";
+        s_chess_state.advantage_text = "Unknown";
         xSemaphoreGive(s_chess_mutex);
         return false;
     }
@@ -541,16 +692,36 @@ static bool refresh_chess_state(void)
         xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
         s_chess_state.board_valid = false;
         s_chess_state.status_text = "FEN parse error";
+        s_chess_state.game_text = "VS --";
+        s_chess_state.last_move_text = "--";
+        s_chess_state.advantage_text = "Unknown";
         xSemaphoreGive(s_chess_mutex);
         return false;
     }
     extract_last_move_from_pgn(selected_game->pgn, board.last_move);
+    std::string last_san = extract_last_san_from_pgn(selected_game->pgn);
+    if (last_san.empty()) {
+        last_san = "--";
+    }
+
+    std::string white_lower = selected_game->white;
+    std::string black_lower = selected_game->black;
+    for (char &ch : white_lower) ch = (char)std::tolower((unsigned char)ch);
+    for (char &ch : black_lower) ch = (char)std::tolower((unsigned char)ch);
+
+    std::string opponent = selected_game->black;
+    if (user_lower == black_lower) {
+        opponent = selected_game->white;
+    }
 
     xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
     s_chess_state.selected_url = selected;
     s_chess_state.board = board;
     s_chess_state.board_valid = true;
     s_chess_state.status_text = selected_game->white + " vs " + selected_game->black;
+    s_chess_state.game_text = "VS " + opponent;
+    s_chess_state.last_move_text = last_san;
+    s_chess_state.advantage_text = compute_advantage_text(board);
     xSemaphoreGive(s_chess_mutex);
     save_selected_url_to_nvs(selected);
     return true;
@@ -682,30 +853,28 @@ static void chess_refresh_task(void *arg)
         BoardState board = s_chess_state.board;
         bool valid = s_chess_state.board_valid;
         std::string status = s_chess_state.status_text;
+        std::string game = s_chess_state.game_text;
+        std::string last_move = s_chess_state.last_move_text;
+        std::string advantage = s_chess_state.advantage_text;
         xSemaphoreGive(s_chess_mutex);
-        render_board_ui(board, valid, status.c_str());
+        render_board_ui(board, valid, status.c_str(), game.c_str(), last_move.c_str(), advantage.c_str());
         ulTaskNotifyTake(pdTRUE, interval);
     }
 }
 
 static void create_chess_ui(lv_obj_t *screen, int board_top_y)
 {
-    const int PADDING_LEFT = 24;
-    const int PADDING_RIGHT = 24;
-    const int PADDING_BOTTOM = 8;
-    int board_max_w = LCD_WIDTH - PADDING_LEFT - PADDING_RIGHT;
-    int board_max_h = LCD_HEIGHT - board_top_y - PADDING_BOTTOM - 20;
-    int square = (board_max_w < board_max_h ? board_max_w : board_max_h) / 8;
-    if (square < 16) {
-        square = 16;
-    }
-    int board_size = square * 8;
+    const int PADDING_LEFT = 16;
+    const int BOARD_SIZE = 168;
+    const int BODY_GAP = 16;
+    const int DETAILS_X = PADDING_LEFT + BOARD_SIZE + BODY_GAP;
+    const int square = BOARD_SIZE / 8;
 
     lv_obj_t *board_container = lv_obj_create(screen);
-    lv_obj_set_size(board_container, board_size, board_size);
+    lv_obj_set_size(board_container, BOARD_SIZE, BOARD_SIZE);
     lv_obj_set_pos(board_container, PADDING_LEFT, board_top_y);
     lv_obj_set_style_bg_opa(board_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(board_container, 1, 0);
+    lv_obj_set_style_border_width(board_container, 2, 0);
     lv_obj_set_style_border_color(board_container, lv_color_black(), 0);
     lv_obj_set_style_pad_all(board_container, 0, 0);
     lv_obj_set_style_radius(board_container, 0, 0);
@@ -719,20 +888,55 @@ static void create_chess_ui(lv_obj_t *screen, int board_top_y)
             lv_obj_set_style_radius(s_square_obj[r][c], 0, 0);
             lv_obj_set_style_pad_all(s_square_obj[r][c], 0, 0);
 
-            s_piece_layer[r][c] = lv_obj_create(s_square_obj[r][c]);
-            lv_obj_set_size(s_piece_layer[r][c], square, square);
-            lv_obj_set_pos(s_piece_layer[r][c], 0, 0);
-            lv_obj_set_style_bg_opa(s_piece_layer[r][c], LV_OPA_TRANSP, 0);
-            lv_obj_set_style_border_width(s_piece_layer[r][c], 0, 0);
-            lv_obj_set_style_radius(s_piece_layer[r][c], 0, 0);
-            lv_obj_set_style_pad_all(s_piece_layer[r][c], 0, 0);
+            s_piece_label[r][c] = lv_label_create(s_square_obj[r][c]);
+            lv_obj_set_style_text_font(s_piece_label[r][c], chess_piece_font(), 0);
+            lv_obj_set_style_text_color(s_piece_label[r][c], lv_color_black(), 0);
+            lv_label_set_text(s_piece_label[r][c], "");
+            lv_obj_center(s_piece_label[r][c]);
         }
     }
 
+    lv_obj_t *title_game = lv_label_create(screen);
+    lv_obj_set_style_text_font(title_game, &Inter_24pt_Bold, 0);
+    lv_obj_set_style_text_color(title_game, lv_color_black(), 0);
+    lv_obj_set_pos(title_game, DETAILS_X, board_top_y + 0);
+    lv_label_set_text(title_game, "Game");
+
+    s_game_value_label = lv_label_create(screen);
+    lv_obj_set_style_text_font(s_game_value_label, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(s_game_value_label, lv_color_black(), 0);
+    lv_obj_set_pos(s_game_value_label, DETAILS_X, board_top_y + 24);
+    lv_label_set_text(s_game_value_label, "VS --");
+
+    lv_obj_t *title_move = lv_label_create(screen);
+    lv_obj_set_style_text_font(title_move, &Inter_24pt_Bold, 0);
+    lv_obj_set_style_text_color(title_move, lv_color_black(), 0);
+    lv_obj_set_pos(title_move, DETAILS_X, board_top_y + 54);
+    lv_label_set_text(title_move, "Last Move");
+
+    s_last_move_value_label = lv_label_create(screen);
+    lv_obj_set_style_text_font(s_last_move_value_label, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(s_last_move_value_label, lv_color_black(), 0);
+    lv_obj_set_pos(s_last_move_value_label, DETAILS_X, board_top_y + 78);
+    lv_label_set_text(s_last_move_value_label, "--");
+
+    lv_obj_t *title_adv = lv_label_create(screen);
+    lv_obj_set_style_text_font(title_adv, &Inter_24pt_Bold, 0);
+    lv_obj_set_style_text_color(title_adv, lv_color_black(), 0);
+    lv_obj_set_pos(title_adv, DETAILS_X, board_top_y + 108);
+    lv_label_set_text(title_adv, "Advantage");
+
+    s_advantage_value_label = lv_label_create(screen);
+    lv_obj_set_style_text_font(s_advantage_value_label, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(s_advantage_value_label, lv_color_black(), 0);
+    lv_obj_set_pos(s_advantage_value_label, DETAILS_X, board_top_y + 132);
+    lv_label_set_text(s_advantage_value_label, "Unknown");
+
+    // Status retained for diagnostics, kept hidden from layout.
     s_status_label = lv_label_create(screen);
     lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_24, 0);
-    lv_obj_set_pos(s_status_label, PADDING_LEFT, board_top_y + board_size + 2);
-    lv_label_set_text(s_status_label, "Loading...");
+    lv_obj_set_pos(s_status_label, LCD_WIDTH + 8, LCD_HEIGHT + 8);
+    lv_label_set_text(s_status_label, "");
 }
 
 extern "C" void app_main(void)
@@ -776,10 +980,9 @@ extern "C" void app_main(void)
 
     if (Lvgl_lock(-1)) {
         lv_obj_t *screen = lv_screen_active();
-        const int PADDING_LEFT = 24;
-        const int PADDING_TOP = 24;
-        const int LINE_HEIGHT_INTER = 29;
-        const int GAP_AFTER_DATE = 16;
+        const int PADDING_LEFT = 16;
+        const int PADDING_TOP = 16;
+        const int HEADER_GAP = 8;
 
         lv_obj_t *greeting = lv_label_create(screen);
         lv_label_set_text(greeting, "Hello Kyle");
@@ -789,11 +992,11 @@ extern "C" void app_main(void)
         s_date_label = lv_label_create(screen);
         lv_label_set_text(s_date_label, "Its ...");
         lv_obj_set_style_text_font(s_date_label, &Inter_24pt_Bold, 0);
-        lv_obj_align(s_date_label, LV_ALIGN_TOP_LEFT, PADDING_LEFT, PADDING_TOP + LINE_HEIGHT_INTER);
+        lv_obj_align_to(s_date_label, greeting, LV_ALIGN_OUT_BOTTOM_LEFT, 0, HEADER_GAP);
 
-        const int DIVIDER_WIDTH = 350;
-        const int DIVIDER_HEIGHT = 5;
-        int line_y = PADDING_TOP + LINE_HEIGHT_INTER * 2 + GAP_AFTER_DATE;
+        const int DIVIDER_WIDTH = 368;
+        const int DIVIDER_HEIGHT = 4;
+        int line_y = PADDING_TOP + 24 + HEADER_GAP + 24 + 8;
         lv_obj_t *line = lv_obj_create(screen);
         lv_obj_set_size(line, DIVIDER_WIDTH, DIVIDER_HEIGHT);
         lv_obj_align(line, LV_ALIGN_TOP_LEFT, PADDING_LEFT, line_y);
@@ -803,9 +1006,9 @@ extern "C" void app_main(void)
         lv_obj_set_style_border_width(line, 0, 0);
 
         s_time_label = lv_label_create(screen);
-        lv_label_set_text(s_time_label, "12:00:00 AM");
+        lv_label_set_text(s_time_label, "10:53 AM");
         lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_24, 0);
-        lv_obj_align(s_time_label, LV_ALIGN_TOP_RIGHT, -PADDING_LEFT, PADDING_TOP);
+        lv_obj_align(s_time_label, LV_ALIGN_TOP_RIGHT, -16, PADDING_TOP);
 
         create_chess_ui(screen, line_y + DIVIDER_HEIGHT + 8);
         Lvgl_unlock();
