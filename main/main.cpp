@@ -20,11 +20,15 @@
 #include <esp_netif.h>
 #include <esp_sntp.h>
 #include <esp_timer.h>
+#include <driver/gpio.h>
 #include <esp_http_server.h>
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
 #include <nvs_flash.h>
 #include <nvs.h>
+#include <esp_adc/adc_oneshot.h>
+#include <esp_adc/adc_cali.h>
+#include <esp_adc/adc_cali_scheme.h>
 
 #include <cJSON.h>
 
@@ -33,7 +37,6 @@
 #include "lvgl.h"
 
 extern const lv_font_t Inter_24pt_Bold;
-extern const lv_font_t NotoSansSymbols2_24;
 
 static const char *TAG = "main";
 
@@ -47,6 +50,10 @@ static const char *TAG = "main";
 #define WIFI_FAIL_BIT       BIT1
 #define NTP_SYNC_BIT        BIT2
 
+#ifndef CONFIG_KEY_BUTTON_GPIO
+#define CONFIG_KEY_BUTTON_GPIO 18
+#endif
+
 static const int WIFI_MAX_RETRY = 10;
 static const char *NVS_NAMESPACE = "chess";
 static const char *NVS_KEY_SELECTED_URL = "selected_url";
@@ -54,6 +61,7 @@ static const char *NVS_KEY_SELECTED_URL = "selected_url";
 static EventGroupHandle_t s_wifi_event_group;
 static SemaphoreHandle_t s_chess_mutex;
 static TaskHandle_t s_chess_task = NULL;
+static TaskHandle_t s_key_task = NULL;
 static httpd_handle_t s_httpd = NULL;
 static int s_retry_num = 0;
 
@@ -65,6 +73,17 @@ static lv_obj_t *s_last_move_value_label = NULL;
 static lv_obj_t *s_advantage_value_label = NULL;
 static lv_obj_t *s_square_obj[8][8] = {};
 static lv_obj_t *s_piece_layer[8][8] = {};
+
+static adc_oneshot_unit_handle_t s_adc_handle = NULL;
+static adc_channel_t s_battery_channel = ADC_CHANNEL_0;
+static adc_cali_handle_t s_adc_cali_handle = NULL;
+static bool s_adc_cali_enabled = false;
+static int s_battery_last_raw = 0;
+static int s_battery_last_pin_mv = 0;
+static int s_battery_last_vbat_mv = 0;
+static int s_battery_filtered_pct = -1;
+static int s_battery_display_pct = -1;
+static int s_battery_update_tick = 0;
 
 struct LastMove {
     bool valid = false;
@@ -111,6 +130,132 @@ static const char *const MONTH[] = {
 
 DisplayPort RlcdPort(LCD_PIN_MOSI, LCD_PIN_SCL, LCD_PIN_DC, LCD_PIN_CS, LCD_PIN_RST,
                      LCD_WIDTH, LCD_HEIGHT);
+
+static bool battery_gpio_to_channel(int gpio, adc_channel_t *out_channel)
+{
+    switch (gpio) {
+        case 1: *out_channel = ADC_CHANNEL_0; return true;
+        case 2: *out_channel = ADC_CHANNEL_1; return true;
+        case 3: *out_channel = ADC_CHANNEL_2; return true;
+        case 4: *out_channel = ADC_CHANNEL_3; return true;
+        case 5: *out_channel = ADC_CHANNEL_4; return true;
+        case 6: *out_channel = ADC_CHANNEL_5; return true;
+        case 7: *out_channel = ADC_CHANNEL_6; return true;
+        case 8: *out_channel = ADC_CHANNEL_7; return true;
+        case 9: *out_channel = ADC_CHANNEL_8; return true;
+        case 10: *out_channel = ADC_CHANNEL_9; return true;
+        default: return false;
+    }
+}
+
+static void battery_adc_init(void)
+{
+    if (!battery_gpio_to_channel(CONFIG_BATTERY_ADC_GPIO, &s_battery_channel)) {
+        ESP_LOGW(TAG, "Invalid battery ADC GPIO=%d; battery percent disabled", CONFIG_BATTERY_ADC_GPIO);
+        return;
+    }
+
+    adc_oneshot_unit_init_cfg_t unit_cfg = {};
+    unit_cfg.unit_id = ADC_UNIT_1;
+    unit_cfg.ulp_mode = ADC_ULP_MODE_DISABLE;
+    if (adc_oneshot_new_unit(&unit_cfg, &s_adc_handle) != ESP_OK) {
+        ESP_LOGW(TAG, "Battery ADC unit init failed");
+        s_adc_handle = NULL;
+        return;
+    }
+
+    adc_oneshot_chan_cfg_t chan_cfg = {};
+    chan_cfg.atten = ADC_ATTEN_DB_12;
+    chan_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+    if (adc_oneshot_config_channel(s_adc_handle, s_battery_channel, &chan_cfg) != ESP_OK) {
+        ESP_LOGW(TAG, "Battery ADC channel config failed");
+        s_adc_handle = NULL;
+        return;
+    }
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    adc_cali_curve_fitting_config_t cali_cfg = {};
+    cali_cfg.unit_id = ADC_UNIT_1;
+    cali_cfg.chan = s_battery_channel;
+    cali_cfg.atten = ADC_ATTEN_DB_12;
+    cali_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+    if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_adc_cali_handle) == ESP_OK) {
+        s_adc_cali_enabled = true;
+    }
+#endif
+}
+
+static int read_battery_percent(void)
+{
+    if (!s_adc_handle) {
+        return -1;
+    }
+
+    // Make displayed battery "stickier": refresh underlying ADC every 10 seconds.
+    s_battery_update_tick++;
+    if ((s_battery_update_tick % 10) != 0 && s_battery_display_pct >= 0) {
+        return s_battery_display_pct;
+    }
+
+    // Reduce ADC noise by averaging several back-to-back samples.
+    const int sample_count = 8;
+    int raw_sum = 0;
+    for (int i = 0; i < sample_count; ++i) {
+        int raw_sample = 0;
+        if (adc_oneshot_read(s_adc_handle, s_battery_channel, &raw_sample) != ESP_OK) {
+            return -1;
+        }
+        raw_sum += raw_sample;
+    }
+    int raw = raw_sum / sample_count;
+    s_battery_last_raw = raw;
+
+    int mv_at_pin = 0;
+    if (s_adc_cali_enabled) {
+        if (adc_cali_raw_to_voltage(s_adc_cali_handle, raw, &mv_at_pin) != ESP_OK) {
+            return -1;
+        }
+    } else {
+        mv_at_pin = (raw * 3300) / 4095;
+    }
+    s_battery_last_pin_mv = mv_at_pin;
+
+    int64_t rtop = CONFIG_BATTERY_DIVIDER_RTOP_OHMS;
+    int64_t rbot = CONFIG_BATTERY_DIVIDER_RBOT_OHMS;
+    int64_t vbat_mv = (int64_t)mv_at_pin * (rtop + rbot) / rbot;
+    s_battery_last_vbat_mv = (int)vbat_mv;
+
+    int empty_mv = CONFIG_BATTERY_EMPTY_MV;
+    int full_mv = CONFIG_BATTERY_FULL_MV;
+    if (full_mv <= empty_mv) {
+        return -1;
+    }
+
+    int pct = (int)((vbat_mv - empty_mv) * 100 / (full_mv - empty_mv));
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
+    // Low-pass filter to stabilize readings.
+    if (s_battery_filtered_pct < 0) {
+        s_battery_filtered_pct = pct;
+    } else {
+        s_battery_filtered_pct = (s_battery_filtered_pct * 7 + pct) / 8;
+    }
+
+    // Hysteresis so displayed percentage doesn't flicker every second.
+    if (s_battery_display_pct < 0) {
+        s_battery_display_pct = s_battery_filtered_pct;
+    } else {
+        int diff = s_battery_filtered_pct - s_battery_display_pct;
+        if (diff >= 2) {
+            s_battery_display_pct++;
+        } else if (diff <= -2) {
+            s_battery_display_pct--;
+        }
+    }
+
+    return s_battery_display_pct;
+}
 
 static void lvgl_flush_cb(lv_display_t *drv, const lv_area_t *area, uint8_t *color_map)
 {
@@ -208,6 +353,7 @@ static void ordinal_suffix(int day, char *buf, size_t cap)
 
 static void update_clock_cb(void *arg)
 {
+    static int s_battery_log_tick = 0;
     time_t now = time(NULL);
     struct tm tm;
     if (localtime_r(&now, &tm) == NULL) {
@@ -225,8 +371,13 @@ static void update_clock_cb(void *arg)
         h12 = 12;
     }
     const char *ampm = (tm.tm_hour < 12) ? "AM" : "PM";
-    char time_buf[16];
-    snprintf(time_buf, sizeof(time_buf), "%d:%02d %s", h12, tm.tm_min, ampm);
+    int batt_pct = read_battery_percent();
+    char time_buf[32];
+    if (batt_pct >= 0) {
+        snprintf(time_buf, sizeof(time_buf), "%d:%02d %s | %d%%", h12, tm.tm_min, ampm, batt_pct);
+    } else {
+        snprintf(time_buf, sizeof(time_buf), "%d:%02d %s | --%%", h12, tm.tm_min, ampm);
+    }
 
     if (Lvgl_lock(50)) {
         if (s_date_label) {
@@ -236,6 +387,19 @@ static void update_clock_cb(void *arg)
             lv_label_set_text(s_time_label, time_buf);
         }
         Lvgl_unlock();
+    }
+
+    if (++s_battery_log_tick >= 30) {
+        s_battery_log_tick = 0;
+        ESP_LOGI(TAG, "Battery ADC gpio=%d raw=%d pin=%dmV vbat=%dmV pct=%d",
+                 CONFIG_BATTERY_ADC_GPIO,
+                 s_battery_last_raw,
+                 s_battery_last_pin_mv,
+                 s_battery_last_vbat_mv,
+                 batt_pct);
+        if (s_battery_last_raw < 20) {
+            ESP_LOGW(TAG, "Battery ADC raw is near zero; check ADC GPIO/divider wiring and menuconfig");
+        }
     }
 }
 
@@ -946,6 +1110,58 @@ static void start_http_server(void)
     httpd_register_uri_handler(s_httpd, &select_uri);
 }
 
+static void cycle_to_next_game(void)
+{
+    std::string selected;
+    bool ok = false;
+    xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
+    size_t n = s_chess_state.games.size();
+    if (n > 0) {
+        size_t idx = 0;
+        bool found = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (s_chess_state.games[i].url == s_chess_state.selected_url) {
+                idx = i;
+                found = true;
+                break;
+            }
+        }
+        size_t next = found ? ((idx + 1) % n) : 0;
+        selected = s_chess_state.games[next].url;
+        s_chess_state.selected_url = selected;
+        ok = true;
+    }
+    xSemaphoreGive(s_chess_mutex);
+
+    if (!ok) {
+        return;
+    }
+
+    save_selected_url_to_nvs(selected);
+    if (s_chess_task) {
+        xTaskNotifyGive(s_chess_task);
+    }
+}
+
+static void key_button_task(void *arg)
+{
+    const gpio_num_t key_gpio = (gpio_num_t)CONFIG_KEY_BUTTON_GPIO;
+    int prev_level = gpio_get_level(key_gpio);
+    TickType_t last_press = 0;
+    const TickType_t debounce = pdMS_TO_TICKS(220);
+
+    while (true) {
+        int level = gpio_get_level(key_gpio);
+        TickType_t now = xTaskGetTickCount();
+        if (prev_level == 1 && level == 0 && (now - last_press) > debounce) {
+            last_press = now;
+            cycle_to_next_game();
+        }
+        prev_level = level;
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+}
+
 static void chess_refresh_task(void *arg)
 {
     const TickType_t interval = pdMS_TO_TICKS(CONFIG_CHESS_REFRESH_SECONDS * 1000);
@@ -1060,6 +1276,14 @@ extern "C" void app_main(void)
         xSemaphoreGive(s_chess_mutex);
     }
 
+    gpio_config_t key_cfg = {};
+    key_cfg.pin_bit_mask = (1ULL << CONFIG_KEY_BUTTON_GPIO);
+    key_cfg.mode = GPIO_MODE_INPUT;
+    key_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+    key_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    key_cfg.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&key_cfg);
+
     wifi_init_sta();
     EventBits_t bits = xEventGroupWaitBits(
         s_wifi_event_group,
@@ -1081,6 +1305,7 @@ extern "C" void app_main(void)
     }
 
     RlcdPort.RLCD_Init();
+    battery_adc_init();
     Lvgl_PortInit(LCD_WIDTH, LCD_HEIGHT, lvgl_flush_cb);
 
     if (Lvgl_lock(-1)) {
@@ -1111,7 +1336,7 @@ extern "C" void app_main(void)
         lv_obj_set_style_border_width(line, 0, 0);
 
         s_time_label = lv_label_create(screen);
-        lv_label_set_text(s_time_label, "10:53 AM");
+        lv_label_set_text(s_time_label, "10:53 AM | --%");
         lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_24, 0);
         lv_obj_align(s_time_label, LV_ALIGN_TOP_RIGHT, -16, PADDING_TOP);
 
@@ -1129,4 +1354,5 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(clock_timer, 1000000));
 
     xTaskCreate(chess_refresh_task, "chess_refresh", 12288, NULL, 4, &s_chess_task);
+    xTaskCreate(key_button_task, "key_button", 4096, NULL, 3, &s_key_task);
 }
