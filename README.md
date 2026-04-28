@@ -55,3 +55,26 @@ The clock shows “Hello Kyle, its Sunday, February 22nd” and the time in `HH:
 4. Build and flash.
 
 Time is synced from NTP (pool.ntp.org). The default timezone is US Central (`CST6CDT`). To change it, edit the `setenv("TZ", ...)` line in `main/main.cpp` (e.g. `PST8PDT` for Pacific, `EST5EDT` for Eastern).
+
+### Chess.com daily board
+
+The display now uses the large lower area for an 8x8 chess board sourced from one selected Chess.com daily game.
+
+1. Run `idf.py menuconfig`.
+2. Open **Clock / WiFi Configuration**.
+3. Set:
+   - **Chess.com Username** (default: `H3GGERS`)
+   - **Chess refresh interval (seconds)** (default: `60`)
+4. Build and flash.
+
+After WiFi connects, the ESP32 hosts a small game selector page on its local IP:
+
+- Open `http://<device-ip>/` from your phone/laptop on the same network.
+- Choose the daily game from the dropdown and submit.
+- Selection is stored in NVS and survives reboot.
+- `http://<device-ip>/refresh` triggers an immediate fetch.
+
+Notes:
+- Board state comes from Chess.com FEN data.
+- Last-move highlight is best-effort (if a coordinate-style move token is present in PGN text).
+- If Chess.com is unreachable, the last rendered board stays on screen and status text updates.

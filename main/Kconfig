@@ -11,4 +11,17 @@ menu "Clock / WiFi Configuration"
         default "your_password"
         help
             Password of the WiFi AP.
+
+    config CHESS_USERNAME
+        string "Chess.com Username"
+        default "H3GGERS"
+        help
+            Chess.com username used to fetch daily games.
+
+    config CHESS_REFRESH_SECONDS
+        int "Chess refresh interval (seconds)"
+        range 15 3600
+        default 60
+        help
+            Polling interval for refreshing the selected daily game board.
 endmenu

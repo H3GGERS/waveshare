@@ -1,21 +1,32 @@
 /**
- * ESP32-S3 4.2" RLCD - Clock + date view
- * Shows: "Hello Kyle, its Sunday, February 22nd" and time [HH:MM:SS] with live seconds.
+ * ESP32-S3 4.2" RLCD - Clock + Chess.com daily board
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <cctype>
+#include <string>
+#include <vector>
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
+#include <freertos/semphr.h>
+
 #include <esp_log.h>
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <esp_netif.h>
-#include <nvs_flash.h>
 #include <esp_sntp.h>
 #include <esp_timer.h>
+#include <esp_http_server.h>
+#include <esp_http_client.h>
+#include <esp_crt_bundle.h>
+#include <nvs_flash.h>
+#include <nvs.h>
+
+#include <cJSON.h>
 
 #include "display_bsp.h"
 #include "lvgl_bsp.h"
@@ -25,7 +36,6 @@ extern const lv_font_t Inter_24pt_Bold;
 
 static const char *TAG = "main";
 
-// Pin assignments for Waveshare ESP32-S3-RLCD-4.2 (300×400 landscape)
 #define LCD_PIN_MOSI  12
 #define LCD_PIN_SCL   11
 #define LCD_PIN_DC    5
@@ -36,13 +46,53 @@ static const char *TAG = "main";
 #define WIFI_FAIL_BIT       BIT1
 #define NTP_SYNC_BIT        BIT2
 
-static EventGroupHandle_t s_wifi_event_group;
-static int s_retry_num = 0;
 static const int WIFI_MAX_RETRY = 10;
+static const char *NVS_NAMESPACE = "chess";
+static const char *NVS_KEY_SELECTED_URL = "selected_url";
 
-static lv_obj_t *s_greeting_label = NULL;  // "Hello Kyle"
-static lv_obj_t *s_date_label = NULL;      // "Its Sunday, February 22nd"
-static lv_obj_t *s_time_label = NULL;      // "01:03:13 AM" (top-right)
+static EventGroupHandle_t s_wifi_event_group;
+static SemaphoreHandle_t s_chess_mutex;
+static TaskHandle_t s_chess_task = NULL;
+static httpd_handle_t s_httpd = NULL;
+static int s_retry_num = 0;
+
+static lv_obj_t *s_date_label = NULL;
+static lv_obj_t *s_time_label = NULL;
+static lv_obj_t *s_status_label = NULL;
+static lv_obj_t *s_square_obj[8][8] = {};
+static lv_obj_t *s_piece_layer[8][8] = {};
+
+struct LastMove {
+    bool valid = false;
+    int from_file = -1;
+    int from_rank = -1;
+    int to_file = -1;
+    int to_rank = -1;
+};
+
+struct BoardState {
+    char board[8][8] = {};
+    LastMove last_move = {};
+    bool white_to_move = true;
+};
+
+struct ChessGameSummary {
+    std::string url;
+    std::string white;
+    std::string black;
+    std::string fen;
+    std::string pgn;
+};
+
+struct ChessState {
+    std::string selected_url;
+    std::vector<ChessGameSummary> games;
+    BoardState board = {};
+    bool board_valid = false;
+    std::string status_text = "Loading...";
+};
+
+static ChessState s_chess_state;
 
 static const char *const WEEKDAY[] = {
     "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
@@ -55,7 +105,6 @@ static const char *const MONTH[] = {
 DisplayPort RlcdPort(LCD_PIN_MOSI, LCD_PIN_SCL, LCD_PIN_DC, LCD_PIN_CS, LCD_PIN_RST,
                      LCD_WIDTH, LCD_HEIGHT);
 
-// Flush: write LVGL area into RLCD buffer, push to display once, then signal ready.
 static void lvgl_flush_cb(lv_display_t *drv, const lv_area_t *area, uint8_t *color_map)
 {
     uint16_t *buf = (uint16_t *)color_map;
@@ -96,8 +145,10 @@ static void wifi_init_sta(void)
 
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
 
     wifi_config_t wifi_config = {};
     strncpy((char *)wifi_config.sta.ssid, CONFIG_WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
@@ -117,23 +168,21 @@ static void time_sync_notification_cb(struct timeval *tv)
 
 static void init_time(void)
 {
-    ESP_LOGI(TAG, "Initializing SNTP");
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
     esp_sntp_init();
 
-    // Wait for first sync (up to 15 s)
     for (int i = 0; i < 15; i++) {
-        if (xEventGroupGetBits(s_wifi_event_group) & NTP_SYNC_BIT)
+        if (xEventGroupGetBits(s_wifi_event_group) & NTP_SYNC_BIT) {
             break;
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    setenv("TZ", "MST7MDT,M3.2.0,M11.1.0", 1);  // US Mountain
+    setenv("TZ", "MST7MDT,M3.2.0,M11.1.0", 1);
     tzset();
 }
 
-// Ordinal suffix for day: 1st, 2nd, 3rd, 4th, 22nd, etc.
 static void ordinal_suffix(int day, char *buf, size_t cap)
 {
     if (day >= 11 && day <= 13) {
@@ -154,8 +203,9 @@ static void update_clock_cb(void *arg)
 {
     time_t now = time(NULL);
     struct tm tm;
-    if (localtime_r(&now, &tm) == NULL)
+    if (localtime_r(&now, &tm) == NULL) {
         return;
+    }
 
     char date_buf[64];
     char suffix[4];
@@ -164,37 +214,558 @@ static void update_clock_cb(void *arg)
              WEEKDAY[tm.tm_wday], MONTH[tm.tm_mon], tm.tm_mday, suffix);
 
     int h12 = tm.tm_hour % 12;
-    if (h12 == 0) h12 = 12;
+    if (h12 == 0) {
+        h12 = 12;
+    }
     const char *ampm = (tm.tm_hour < 12) ? "AM" : "PM";
     char time_buf[16];
     snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d %s", h12, tm.tm_min, tm.tm_sec, ampm);
 
     if (Lvgl_lock(50)) {
-        if (s_date_label)
+        if (s_date_label) {
             lv_label_set_text(s_date_label, date_buf);
-        if (s_time_label)
+        }
+        if (s_time_label) {
             lv_label_set_text(s_time_label, time_buf);
+        }
         Lvgl_unlock();
     }
 }
 
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    std::string *body = static_cast<std::string *>(evt->user_data);
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data && evt->data_len > 0) {
+        body->append((const char *)evt->data, evt->data_len);
+    }
+    return ESP_OK;
+}
+
+static bool http_get_string(const std::string &url, std::string &out_body)
+{
+    out_body.clear();
+    esp_http_client_config_t cfg = {};
+    cfg.url = url.c_str();
+    cfg.method = HTTP_METHOD_GET;
+    cfg.timeout_ms = 12000;
+    cfg.event_handler = http_event_handler;
+    cfg.user_data = &out_body;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        return false;
+    }
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    return (err == ESP_OK && status == 200);
+}
+
+static bool parse_fen_to_board(const std::string &fen, BoardState &out)
+{
+    memset(out.board, 0, sizeof(out.board));
+    out.last_move.valid = false;
+
+    size_t space = fen.find(' ');
+    std::string board_part = (space == std::string::npos) ? fen : fen.substr(0, space);
+    std::string turn_part;
+    if (space != std::string::npos && space + 2 < fen.size()) {
+        turn_part = fen.substr(space + 1, 1);
+    }
+    out.white_to_move = (turn_part != "b");
+
+    int rank = 0;
+    int file = 0;
+    for (char ch : board_part) {
+        if (ch == '/') {
+            rank++;
+            file = 0;
+            continue;
+        }
+        if (ch >= '1' && ch <= '8') {
+            file += (ch - '0');
+            continue;
+        }
+        if (rank < 0 || rank > 7 || file < 0 || file > 7) {
+            return false;
+        }
+        out.board[rank][file] = ch;
+        file++;
+    }
+    return true;
+}
+
+static bool extract_last_move_from_pgn(const std::string &pgn, LastMove &out)
+{
+    out.valid = false;
+    for (size_t i = 0; i + 3 < pgn.size(); ++i) {
+        if (pgn[i] >= 'a' && pgn[i] <= 'h' &&
+            pgn[i + 1] >= '1' && pgn[i + 1] <= '8' &&
+            pgn[i + 2] >= 'a' && pgn[i + 2] <= 'h' &&
+            pgn[i + 3] >= '1' && pgn[i + 3] <= '8') {
+            out.from_file = pgn[i] - 'a';
+            out.from_rank = 7 - (pgn[i + 1] - '1');
+            out.to_file = pgn[i + 2] - 'a';
+            out.to_rank = 7 - (pgn[i + 3] - '1');
+            out.valid = true;
+        }
+    }
+    return out.valid;
+}
+
+static std::string safe_json_string(cJSON *obj, const char *key)
+{
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsString(v) && v->valuestring ? std::string(v->valuestring) : std::string();
+}
+
+static bool fetch_daily_games(std::vector<ChessGameSummary> &games)
+{
+    games.clear();
+    std::string body;
+    std::string url = "https://api.chess.com/pub/player/" + std::string(CONFIG_CHESS_USERNAME) + "/games";
+    if (!http_get_string(url, body)) {
+        return false;
+    }
+
+    cJSON *root = cJSON_Parse(body.c_str());
+    if (!root) {
+        return false;
+    }
+
+    cJSON *arr = cJSON_GetObjectItemCaseSensitive(root, "games");
+    if (!cJSON_IsArray(arr)) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    cJSON *game = NULL;
+    cJSON_ArrayForEach(game, arr) {
+        std::string time_class = safe_json_string(game, "time_class");
+        std::string rules = safe_json_string(game, "rules");
+        if (time_class != "daily" || rules != "chess") {
+            continue;
+        }
+
+        ChessGameSummary g;
+        g.url = safe_json_string(game, "url");
+        g.fen = safe_json_string(game, "fen");
+        g.pgn = safe_json_string(game, "pgn");
+
+        cJSON *white = cJSON_GetObjectItemCaseSensitive(game, "white");
+        cJSON *black = cJSON_GetObjectItemCaseSensitive(game, "black");
+        if (white) {
+            g.white = safe_json_string(white, "username");
+        }
+        if (black) {
+            g.black = safe_json_string(black, "username");
+        }
+        if (!g.url.empty() && !g.fen.empty()) {
+            games.push_back(g);
+        }
+    }
+
+    cJSON_Delete(root);
+    return true;
+}
+
+static bool load_selected_url_from_nvs(std::string &url)
+{
+    url.clear();
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return false;
+    }
+    size_t required = 0;
+    if (nvs_get_str(handle, NVS_KEY_SELECTED_URL, NULL, &required) != ESP_OK || required == 0) {
+        nvs_close(handle);
+        return false;
+    }
+    std::vector<char> buf(required);
+    if (nvs_get_str(handle, NVS_KEY_SELECTED_URL, buf.data(), &required) == ESP_OK) {
+        url = std::string(buf.data());
+        nvs_close(handle);
+        return true;
+    }
+    nvs_close(handle);
+    return false;
+}
+
+static void save_selected_url_to_nvs(const std::string &url)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    nvs_set_str(handle, NVS_KEY_SELECTED_URL, url.c_str());
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void draw_rect(lv_obj_t *parent, int x, int y, int w, int h, lv_color_t color)
+{
+    lv_obj_t *r = lv_obj_create(parent);
+    lv_obj_set_size(r, w, h);
+    lv_obj_set_pos(r, x, y);
+    lv_obj_set_style_bg_color(r, color, 0);
+    lv_obj_set_style_border_width(r, 0, 0);
+    lv_obj_set_style_radius(r, 0, 0);
+    lv_obj_set_style_pad_all(r, 0, 0);
+}
+
+static void draw_piece_bitmap(lv_obj_t *layer, char piece, int sq, bool light_square)
+{
+    if (piece == 0) {
+        return;
+    }
+    bool is_white = std::isupper((unsigned char)piece);
+    lv_color_t piece_color = is_white ? lv_color_white() : lv_color_black();
+    if ((is_white && light_square) || (!is_white && !light_square)) {
+        piece_color = light_square ? lv_color_black() : lv_color_white();
+    }
+
+    int margin = sq / 6;
+    int body_w = sq - (margin * 2);
+    int body_h = sq - (margin * 2);
+    int x = margin;
+    int y = margin;
+
+    char p = (char)std::tolower((unsigned char)piece);
+    switch (p) {
+        case 'p':
+            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 3, piece_color);
+            draw_rect(layer, x + body_w / 4, y + body_h / 3, body_w / 2, body_h / 2, piece_color);
+            break;
+        case 'n':
+            draw_rect(layer, x + body_w / 4, y + body_h / 4, body_w / 2, body_h / 2, piece_color);
+            draw_rect(layer, x + body_w / 2, y, body_w / 3, body_h / 3, piece_color);
+            break;
+        case 'b':
+            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 2, piece_color);
+            draw_rect(layer, x + body_w / 4, y + body_h / 2, body_w / 2, body_h / 3, piece_color);
+            break;
+        case 'r':
+            draw_rect(layer, x + body_w / 5, y, body_w / 5, body_h / 4, piece_color);
+            draw_rect(layer, x + body_w * 3 / 5, y, body_w / 5, body_h / 4, piece_color);
+            draw_rect(layer, x + body_w / 5, y + body_h / 4, body_w * 3 / 5, body_h / 2, piece_color);
+            break;
+        case 'q':
+            draw_rect(layer, x + body_w / 6, y + body_h / 4, body_w * 2 / 3, body_h / 2, piece_color);
+            draw_rect(layer, x + body_w / 5, y, body_w / 6, body_h / 4, piece_color);
+            draw_rect(layer, x + body_w * 2 / 5, y, body_w / 6, body_h / 4, piece_color);
+            draw_rect(layer, x + body_w * 3 / 5, y, body_w / 6, body_h / 4, piece_color);
+            break;
+        case 'k':
+            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 5, piece_color);
+            draw_rect(layer, x + body_w / 2 - 1, y - 2, 2, body_h / 3, piece_color);
+            draw_rect(layer, x + body_w / 5, y + body_h / 4, body_w * 3 / 5, body_h / 2, piece_color);
+            break;
+        default:
+            draw_rect(layer, x + body_w / 4, y + body_h / 4, body_w / 2, body_h / 2, piece_color);
+            break;
+    }
+}
+
+static void render_board_ui(const BoardState &board, bool valid, const char *status)
+{
+    if (!Lvgl_lock(200)) {
+        return;
+    }
+
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            bool light = ((r + c) % 2 == 0);
+            lv_color_t sq_color = light ? lv_color_white() : lv_color_black();
+
+            if (valid && board.last_move.valid &&
+                ((board.last_move.from_rank == r && board.last_move.from_file == c) ||
+                 (board.last_move.to_rank == r && board.last_move.to_file == c))) {
+                sq_color = light ? lv_color_make(210, 210, 210) : lv_color_make(40, 40, 40);
+            }
+
+            lv_obj_set_style_bg_color(s_square_obj[r][c], sq_color, 0);
+            lv_obj_clean(s_piece_layer[r][c]);
+            if (valid) {
+                draw_piece_bitmap(s_piece_layer[r][c], board.board[r][c], lv_obj_get_width(s_square_obj[r][c]), light);
+            }
+        }
+    }
+
+    if (s_status_label) {
+        lv_label_set_text(s_status_label, status ? status : "");
+    }
+    Lvgl_unlock();
+}
+
+static bool refresh_chess_state(void)
+{
+    std::vector<ChessGameSummary> games;
+    if (!fetch_daily_games(games)) {
+        xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
+        s_chess_state.status_text = "Chess.com offline";
+        xSemaphoreGive(s_chess_mutex);
+        return false;
+    }
+
+    xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
+    s_chess_state.games = games;
+    if (s_chess_state.selected_url.empty() && !games.empty()) {
+        s_chess_state.selected_url = games[0].url;
+    }
+    std::string selected = s_chess_state.selected_url;
+    xSemaphoreGive(s_chess_mutex);
+
+    if (games.empty()) {
+        xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
+        s_chess_state.board_valid = false;
+        s_chess_state.status_text = "No daily games";
+        xSemaphoreGive(s_chess_mutex);
+        return false;
+    }
+
+    const ChessGameSummary *selected_game = nullptr;
+    for (const auto &g : games) {
+        if (g.url == selected) {
+            selected_game = &g;
+            break;
+        }
+    }
+    if (!selected_game) {
+        selected_game = &games[0];
+        selected = selected_game->url;
+    }
+
+    BoardState board = {};
+    if (!parse_fen_to_board(selected_game->fen, board)) {
+        xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
+        s_chess_state.board_valid = false;
+        s_chess_state.status_text = "FEN parse error";
+        xSemaphoreGive(s_chess_mutex);
+        return false;
+    }
+    extract_last_move_from_pgn(selected_game->pgn, board.last_move);
+
+    xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
+    s_chess_state.selected_url = selected;
+    s_chess_state.board = board;
+    s_chess_state.board_valid = true;
+    s_chess_state.status_text = selected_game->white + " vs " + selected_game->black;
+    xSemaphoreGive(s_chess_mutex);
+    save_selected_url_to_nvs(selected);
+    return true;
+}
+
+static std::string http_escape(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (char ch : s) {
+        if (ch == '&') out += "&amp;";
+        else if (ch == '<') out += "&lt;";
+        else if (ch == '>') out += "&gt;";
+        else if (ch == '"') out += "&quot;";
+        else out.push_back(ch);
+    }
+    return out;
+}
+
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    std::vector<ChessGameSummary> games;
+    std::string selected;
+    xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
+    games = s_chess_state.games;
+    selected = s_chess_state.selected_url;
+    xSemaphoreGive(s_chess_mutex);
+
+    std::string html;
+    html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<title>Chess Board Selector</title></head><body>";
+    html += "<h2>Chess.com daily games</h2><p>User: " + http_escape(CONFIG_CHESS_USERNAME) + "</p>";
+    html += "<form method='POST' action='/select'><select name='idx'>";
+    for (size_t i = 0; i < games.size(); ++i) {
+        bool is_selected = (games[i].url == selected);
+        html += "<option value='" + std::to_string(i) + "'";
+        if (is_selected) {
+            html += " selected";
+        }
+        html += ">" + http_escape(games[i].white + " vs " + games[i].black) + "</option>";
+    }
+    html += "</select><button type='submit'>Select</button></form>";
+    html += "<p><a href='/refresh'>Refresh now</a></p></body></html>";
+
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, html.c_str(), html.size());
+}
+
+static esp_err_t refresh_get_handler(httpd_req_t *req)
+{
+    if (s_chess_task) {
+        xTaskNotifyGive(s_chess_task);
+    }
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "Refresh requested");
+}
+
+static esp_err_t select_post_handler(httpd_req_t *req)
+{
+    char content[64] = {};
+    int len = httpd_req_recv(req, content, sizeof(content) - 1);
+    if (len <= 0) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No body");
+    }
+    content[len] = '\0';
+
+    int idx = -1;
+    if (sscanf(content, "idx=%d", &idx) != 1) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing idx");
+    }
+
+    std::string selected;
+    bool ok = false;
+    xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
+    if (idx >= 0 && (size_t)idx < s_chess_state.games.size()) {
+        selected = s_chess_state.games[idx].url;
+        s_chess_state.selected_url = selected;
+        ok = true;
+    }
+    xSemaphoreGive(s_chess_mutex);
+
+    if (!ok) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid idx");
+    }
+
+    save_selected_url_to_nvs(selected);
+    if (s_chess_task) {
+        xTaskNotifyGive(s_chess_task);
+    }
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    return httpd_resp_send(req, NULL, 0);
+}
+
+static void start_http_server(void)
+{
+    if (s_httpd) {
+        return;
+    }
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    if (httpd_start(&s_httpd, &config) != ESP_OK) {
+        return;
+    }
+    httpd_uri_t root_uri = {};
+    root_uri.uri = "/";
+    root_uri.method = HTTP_GET;
+    root_uri.handler = root_get_handler;
+    httpd_register_uri_handler(s_httpd, &root_uri);
+
+    httpd_uri_t refresh_uri = {};
+    refresh_uri.uri = "/refresh";
+    refresh_uri.method = HTTP_GET;
+    refresh_uri.handler = refresh_get_handler;
+    httpd_register_uri_handler(s_httpd, &refresh_uri);
+
+    httpd_uri_t select_uri = {};
+    select_uri.uri = "/select";
+    select_uri.method = HTTP_POST;
+    select_uri.handler = select_post_handler;
+    httpd_register_uri_handler(s_httpd, &select_uri);
+}
+
+static void chess_refresh_task(void *arg)
+{
+    const TickType_t interval = pdMS_TO_TICKS(CONFIG_CHESS_REFRESH_SECONDS * 1000);
+    while (true) {
+        refresh_chess_state();
+        xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
+        BoardState board = s_chess_state.board;
+        bool valid = s_chess_state.board_valid;
+        std::string status = s_chess_state.status_text;
+        xSemaphoreGive(s_chess_mutex);
+        render_board_ui(board, valid, status.c_str());
+        ulTaskNotifyTake(pdTRUE, interval);
+    }
+}
+
+static void create_chess_ui(lv_obj_t *screen, int board_top_y)
+{
+    const int PADDING_LEFT = 24;
+    const int PADDING_RIGHT = 24;
+    const int PADDING_BOTTOM = 8;
+    int board_max_w = LCD_WIDTH - PADDING_LEFT - PADDING_RIGHT;
+    int board_max_h = LCD_HEIGHT - board_top_y - PADDING_BOTTOM - 20;
+    int square = (board_max_w < board_max_h ? board_max_w : board_max_h) / 8;
+    if (square < 16) {
+        square = 16;
+    }
+    int board_size = square * 8;
+
+    lv_obj_t *board_container = lv_obj_create(screen);
+    lv_obj_set_size(board_container, board_size, board_size);
+    lv_obj_set_pos(board_container, PADDING_LEFT, board_top_y);
+    lv_obj_set_style_bg_opa(board_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(board_container, 1, 0);
+    lv_obj_set_style_border_color(board_container, lv_color_black(), 0);
+    lv_obj_set_style_pad_all(board_container, 0, 0);
+    lv_obj_set_style_radius(board_container, 0, 0);
+
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 8; c++) {
+            s_square_obj[r][c] = lv_obj_create(board_container);
+            lv_obj_set_size(s_square_obj[r][c], square, square);
+            lv_obj_set_pos(s_square_obj[r][c], c * square, r * square);
+            lv_obj_set_style_border_width(s_square_obj[r][c], 0, 0);
+            lv_obj_set_style_radius(s_square_obj[r][c], 0, 0);
+            lv_obj_set_style_pad_all(s_square_obj[r][c], 0, 0);
+
+            s_piece_layer[r][c] = lv_obj_create(s_square_obj[r][c]);
+            lv_obj_set_size(s_piece_layer[r][c], square, square);
+            lv_obj_set_pos(s_piece_layer[r][c], 0, 0);
+            lv_obj_set_style_bg_opa(s_piece_layer[r][c], LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(s_piece_layer[r][c], 0, 0);
+            lv_obj_set_style_radius(s_piece_layer[r][c], 0, 0);
+            lv_obj_set_style_pad_all(s_piece_layer[r][c], 0, 0);
+        }
+    }
+
+    s_status_label = lv_label_create(screen);
+    lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_24, 0);
+    lv_obj_set_pos(s_status_label, PADDING_LEFT, board_top_y + board_size + 2);
+    lv_label_set_text(s_status_label, "Loading...");
+}
+
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "Waveshare ESP32-S3-RLCD-4.2 clock starting...");
+    ESP_LOGI(TAG, "Waveshare ESP32-S3-RLCD-4.2 clock + chess starting...");
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    s_chess_mutex = xSemaphoreCreateMutex();
+    std::string saved_url;
+    if (load_selected_url_from_nvs(saved_url)) {
+        xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
+        s_chess_state.selected_url = saved_url;
+        xSemaphoreGive(s_chess_mutex);
+    }
+
     wifi_init_sta();
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+    EventBits_t bits = xEventGroupWaitBits(
+        s_wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdFALSE,
+        pdFALSE,
+        portMAX_DELAY);
+
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "WiFi connected");
         init_time();
+        start_http_server();
     } else {
-        ESP_LOGW(TAG, "WiFi not connected; set CONFIG_WIFI_SSID/PASSWORD in menuconfig. Using build time.");
-        time_t t = 1730000000;  // fallback: set a fixed time so clock still runs
-        struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+        ESP_LOGW(TAG, "WiFi not connected; using fallback time");
+        time_t t = 1730000000;
+        struct timeval tv = {.tv_sec = t, .tv_usec = 0};
         settimeofday(&tv, NULL);
         setenv("TZ", "MST7MDT,M3.2.0,M11.1.0", 1);
         tzset();
@@ -205,24 +776,21 @@ extern "C" void app_main(void)
 
     if (Lvgl_lock(-1)) {
         lv_obj_t *screen = lv_screen_active();
-
-        // Figma layout: 24pt Bold Inter for greeting/date, separator line
         const int PADDING_LEFT = 24;
         const int PADDING_TOP = 24;
-        const int LINE_HEIGHT_INTER = 29;   // Inter 24pt Bold line height
-        const int GAP_AFTER_DATE = 16;     // space between date and line
+        const int LINE_HEIGHT_INTER = 29;
+        const int GAP_AFTER_DATE = 16;
 
-        s_greeting_label = lv_label_create(screen);
-        lv_label_set_text(s_greeting_label, "Hello Kyle");
-        lv_obj_set_style_text_font(s_greeting_label, &Inter_24pt_Bold, 0);
-        lv_obj_align(s_greeting_label, LV_ALIGN_TOP_LEFT, PADDING_LEFT, PADDING_TOP);
+        lv_obj_t *greeting = lv_label_create(screen);
+        lv_label_set_text(greeting, "Hello Kyle");
+        lv_obj_set_style_text_font(greeting, &Inter_24pt_Bold, 0);
+        lv_obj_align(greeting, LV_ALIGN_TOP_LEFT, PADDING_LEFT, PADDING_TOP);
 
         s_date_label = lv_label_create(screen);
         lv_label_set_text(s_date_label, "Its ...");
         lv_obj_set_style_text_font(s_date_label, &Inter_24pt_Bold, 0);
         lv_obj_align(s_date_label, LV_ALIGN_TOP_LEFT, PADDING_LEFT, PADDING_TOP + LINE_HEIGHT_INTER);
 
-        // Divider from Figma SVG: 350×5 black bar (right end chamfered in design)
         const int DIVIDER_WIDTH = 350;
         const int DIVIDER_HEIGHT = 5;
         int line_y = PADDING_TOP + LINE_HEIGHT_INTER * 2 + GAP_AFTER_DATE;
@@ -234,12 +802,12 @@ extern "C" void app_main(void)
         lv_obj_set_style_pad_all(line, 0, 0);
         lv_obj_set_style_border_width(line, 0, 0);
 
-        // Time: top-right, same y as greeting, Montserrat 24 Regular (lighter than Inter Bold)
         s_time_label = lv_label_create(screen);
         lv_label_set_text(s_time_label, "12:00:00 AM");
         lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_24, 0);
         lv_obj_align(s_time_label, LV_ALIGN_TOP_RIGHT, -PADDING_LEFT, PADDING_TOP);
 
+        create_chess_ui(screen, line_y + DIVIDER_HEIGHT + 8);
         Lvgl_unlock();
     }
 
@@ -250,7 +818,7 @@ extern "C" void app_main(void)
     timer_args.callback = update_clock_cb;
     timer_args.name = "clock";
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &clock_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(clock_timer, 1000000));  // 1 s in us
+    ESP_ERROR_CHECK(esp_timer_start_periodic(clock_timer, 1000000));
 
-    ESP_LOGI(TAG, "Clock display ready");
+    xTaskCreate(chess_refresh_task, "chess_refresh", 12288, NULL, 4, &s_chess_task);
 }

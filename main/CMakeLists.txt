@@ -1,3 +1,3 @@
 idf_component_register(SRCS "main.cpp" "fonts/Inter_24pt_Bold.c"
                         INCLUDE_DIRS "." "fonts"
-                        REQUIRES display_bsp lvgl_port lvgl__lvgl nvs_flash esp_netif esp_wifi esp_event lwip)
+                        REQUIRES display_bsp lvgl_port lvgl__lvgl nvs_flash esp_netif esp_wifi esp_event lwip esp_http_server esp_http_client json mbedtls)
