@@ -42,8 +42,7 @@ static const int WIFI_MAX_RETRY = 10;
 
 static lv_obj_t *s_greeting_label = NULL;  // "Hello Kyle"
 static lv_obj_t *s_date_label = NULL;      // "Its Sunday, February 22nd"
-static lv_obj_t *s_time_label = NULL;      // "01:03:13 "
-static lv_obj_t *s_ampm_label = NULL;      // "PM" (fixed position so it doesn't shift)
+static lv_obj_t *s_time_label = NULL;      // "01:03:13 AM" (top-right)
 
 static const char *const WEEKDAY[] = {
     "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
@@ -168,15 +167,13 @@ static void update_clock_cb(void *arg)
     if (h12 == 0) h12 = 12;
     const char *ampm = (tm.tm_hour < 12) ? "AM" : "PM";
     char time_buf[16];
-    snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d ", h12, tm.tm_min, tm.tm_sec);
+    snprintf(time_buf, sizeof(time_buf), "%02d:%02d:%02d %s", h12, tm.tm_min, tm.tm_sec, ampm);
 
     if (Lvgl_lock(50)) {
         if (s_date_label)
             lv_label_set_text(s_date_label, date_buf);
         if (s_time_label)
             lv_label_set_text(s_time_label, time_buf);
-        if (s_ampm_label)
-            lv_label_set_text(s_ampm_label, ampm);
         Lvgl_unlock();
     }
 }
@@ -209,13 +206,11 @@ extern "C" void app_main(void)
     if (Lvgl_lock(-1)) {
         lv_obj_t *screen = lv_screen_active();
 
-        // Figma layout: 24pt Bold Inter for greeting/date, separator line, then time
+        // Figma layout: 24pt Bold Inter for greeting/date, separator line
         const int PADDING_LEFT = 24;
         const int PADDING_TOP = 24;
-        const int PADDING_BOTTOM = 24;     // match bottom padding so time centers in content area
         const int LINE_HEIGHT_INTER = 29;   // Inter 24pt Bold line height
         const int GAP_AFTER_DATE = 16;     // space between date and line
-        const int GAP_AFTER_LINE = 32;     // space between line and time
 
         s_greeting_label = lv_label_create(screen);
         lv_label_set_text(s_greeting_label, "Hello Kyle");
@@ -239,30 +234,11 @@ extern "C" void app_main(void)
         lv_obj_set_style_pad_all(line, 0, 0);
         lv_obj_set_style_border_width(line, 0, 0);
 
-        // Fixed-width container for time so digits don't cause layout shift (widest: "12:59:59 PM")
-        const int TIME_BOX_WIDTH = 320;
-        const int TIME_BOX_HEIGHT = 60;
-        lv_obj_t *time_container = lv_obj_create(screen);
-        lv_obj_set_size(time_container, TIME_BOX_WIDTH, TIME_BOX_HEIGHT);
-        lv_obj_set_style_bg_opa(time_container, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(time_container, 0, 0);
-        lv_obj_set_style_pad_all(time_container, 0, 0);
-        int time_region_top = line_y + DIVIDER_HEIGHT + GAP_AFTER_LINE;
-        int time_region_bottom = LCD_HEIGHT - PADDING_BOTTOM;
-        int time_region_center_y = (time_region_top + time_region_bottom) / 2;
-        int time_offset_y = time_region_center_y - LCD_HEIGHT / 2;
-        lv_obj_align(time_container, LV_ALIGN_CENTER, 0, time_offset_y);
-
-        // Digits: left-aligned. AM/PM: right-aligned (fixed position so it doesn't shift).
-        s_time_label = lv_label_create(time_container);
-        lv_label_set_text(s_time_label, "12:00:00 ");
-        lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_48, 0);
-        lv_obj_align(s_time_label, LV_ALIGN_LEFT_MID, 0, 0);
-
-        s_ampm_label = lv_label_create(time_container);
-        lv_label_set_text(s_ampm_label, "PM");
-        lv_obj_set_style_text_font(s_ampm_label, &lv_font_montserrat_48, 0);
-        lv_obj_align(s_ampm_label, LV_ALIGN_RIGHT_MID, 0, 0);
+        // Time: top-right, same y as greeting, Montserrat 24 Regular (lighter than Inter Bold)
+        s_time_label = lv_label_create(screen);
+        lv_label_set_text(s_time_label, "12:00:00 AM");
+        lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_24, 0);
+        lv_obj_align(s_time_label, LV_ALIGN_TOP_RIGHT, -PADDING_LEFT, PADDING_TOP);
 
         Lvgl_unlock();
     }
