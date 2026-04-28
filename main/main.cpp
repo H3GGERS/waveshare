@@ -33,7 +33,7 @@
 #include "lvgl.h"
 
 extern const lv_font_t Inter_24pt_Bold;
-extern const lv_font_t NotoSansSymbols2_24 __attribute__((weak));
+extern const lv_font_t NotoSansSymbols2_24;
 
 static const char *TAG = "main";
 
@@ -64,7 +64,7 @@ static lv_obj_t *s_game_value_label = NULL;
 static lv_obj_t *s_last_move_value_label = NULL;
 static lv_obj_t *s_advantage_value_label = NULL;
 static lv_obj_t *s_square_obj[8][8] = {};
-static lv_obj_t *s_piece_label[8][8] = {};
+static lv_obj_t *s_piece_layer[8][8] = {};
 
 struct LastMove {
     bool valid = false;
@@ -340,30 +340,89 @@ static bool extract_last_move_from_pgn(const std::string &pgn, LastMove &out)
 
 static std::string extract_last_san_from_pgn(const std::string &pgn)
 {
-    size_t body_pos = pgn.find("\n\n");
-    std::string moves = (body_pos == std::string::npos) ? pgn : pgn.substr(body_pos + 2);
+    size_t body_pos = pgn.find("\r\n\r\n");
+    size_t skip = 4;
+    if (body_pos == std::string::npos) {
+        body_pos = pgn.find("\n\n");
+        skip = 2;
+    }
+    std::string moves = (body_pos == std::string::npos) ? pgn : pgn.substr(body_pos + skip);
+    size_t first_move = moves.find("1.");
+    if (first_move != std::string::npos) {
+        moves = moves.substr(first_move);
+    }
     std::string token;
     std::string last_san;
+    int current_move_no = 0;
+    bool current_black = false;
+    int last_move_no = 0;
+    bool last_black = false;
+
+    auto is_san_token = [](const std::string &t) -> bool {
+        if (t.empty()) {
+            return false;
+        }
+        if (t == "1-0" || t == "0-1" || t == "1/2-1/2" || t == "*") {
+            return false;
+        }
+        if (t[0] == '{' || t[0] == '[' || t[0] == '(' || t[0] == '$') {
+            return false;
+        }
+        if (t.find(':') != std::string::npos) {
+            return false; // avoid clock timestamps like 0:01:23
+        }
+        if (t.find("...") != std::string::npos) {
+            return false;
+        }
+        size_t dot_pos = t.find('.');
+        if (dot_pos != std::string::npos) {
+            bool numeric = true;
+            for (size_t i = 0; i < dot_pos; ++i) {
+                if (!std::isdigit((unsigned char)t[i])) {
+                    numeric = false;
+                    break;
+                }
+            }
+            if (numeric) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto parse_move_number_token = [](const std::string &t, int &move_no, bool &black_move) -> bool {
+        size_t dot = t.find('.');
+        if (dot == std::string::npos) {
+            return false;
+        }
+        for (size_t i = 0; i < dot; ++i) {
+            if (!std::isdigit((unsigned char)t[i])) {
+                return false;
+            }
+        }
+        move_no = atoi(t.substr(0, dot).c_str());
+        black_move = (t.find("...") != std::string::npos);
+        return true;
+    };
 
     for (char ch : moves) {
         if (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t') {
             if (token.empty()) {
                 continue;
             }
-            bool is_move_number = false;
-            size_t dot_pos = token.find('.');
-            if (dot_pos != std::string::npos) {
-                is_move_number = true;
-                for (size_t i = 0; i < dot_pos; ++i) {
-                    if (!std::isdigit((unsigned char)token[i])) {
-                        is_move_number = false;
-                        break;
-                    }
-                }
+            int parsed_no = 0;
+            bool parsed_black = false;
+            if (parse_move_number_token(token, parsed_no, parsed_black)) {
+                current_move_no = parsed_no;
+                current_black = parsed_black;
+                token.clear();
+                continue;
             }
-            if (!is_move_number &&
-                token != "1-0" && token != "0-1" && token != "1/2-1/2" && token != "*") {
+            if (is_san_token(token)) {
                 last_san = token;
+                last_move_no = current_move_no;
+                last_black = current_black;
+                current_black = !current_black;
             }
             token.clear();
             continue;
@@ -371,9 +430,16 @@ static std::string extract_last_san_from_pgn(const std::string &pgn)
         token.push_back(ch);
     }
 
-    if (!token.empty() &&
-        token != "1-0" && token != "0-1" && token != "1/2-1/2" && token != "*") {
+    if (is_san_token(token)) {
         last_san = token;
+        last_move_no = current_move_no;
+        last_black = current_black;
+    }
+    if (last_san.empty()) {
+        return last_san;
+    }
+    if (last_move_no > 0) {
+        return std::to_string(last_move_no) + (last_black ? "... " : ". ") + last_san;
     }
     return last_san;
 }
@@ -522,23 +588,15 @@ static void save_selected_url_to_nvs(const std::string &url)
     nvs_close(handle);
 }
 
-static const char *piece_to_glyph_utf8(char piece)
+static void draw_rect(lv_obj_t *parent, int x, int y, int w, int h, lv_color_t color)
 {
-    switch (piece) {
-        case 'K': return "\xE2\x99\x94"; // WHITE CHESS KING (U+2654)
-        case 'Q': return "\xE2\x99\x95"; // WHITE CHESS QUEEN (U+2655)
-        case 'R': return "\xE2\x99\x96"; // WHITE CHESS ROOK (U+2656)
-        case 'B': return "\xE2\x99\x97"; // WHITE CHESS BISHOP (U+2657)
-        case 'N': return "\xE2\x99\x98"; // WHITE CHESS KNIGHT (U+2658)
-        case 'P': return "\xE2\x99\x99"; // WHITE CHESS PAWN (U+2659)
-        case 'k': return "\xE2\x99\x9A"; // BLACK CHESS KING (U+265A)
-        case 'q': return "\xE2\x99\x9B"; // BLACK CHESS QUEEN (U+265B)
-        case 'r': return "\xE2\x99\x9C"; // BLACK CHESS ROOK (U+265C)
-        case 'b': return "\xE2\x99\x9D"; // BLACK CHESS BISHOP (U+265D)
-        case 'n': return "\xE2\x99\x9E"; // BLACK CHESS KNIGHT (U+265E)
-        case 'p': return "\xE2\x99\x9F"; // BLACK CHESS PAWN (U+265F)
-        default: return "";
-    }
+    lv_obj_t *r = lv_obj_create(parent);
+    lv_obj_set_size(r, w, h);
+    lv_obj_set_pos(r, x, y);
+    lv_obj_set_style_bg_color(r, color, 0);
+    lv_obj_set_style_border_width(r, 0, 0);
+    lv_obj_set_style_radius(r, 0, 0);
+    lv_obj_set_style_pad_all(r, 0, 0);
 }
 
 static int piece_material_value(char piece)
@@ -582,13 +640,57 @@ static std::string compute_advantage_text(const BoardState &board)
     return "Black +" + std::to_string(-diff);
 }
 
-static const lv_font_t *chess_piece_font()
+static void draw_piece_bitmap(lv_obj_t *layer, char piece, int sq, bool light_square)
 {
-    // If the Noto font is linked in, use it; otherwise keep rendering with Montserrat.
-    if (&NotoSansSymbols2_24) {
-        return &NotoSansSymbols2_24;
+    if (piece == 0) {
+        return;
     }
-    return &lv_font_montserrat_24;
+    bool is_white = std::isupper((unsigned char)piece);
+    lv_color_t piece_color = is_white ? lv_color_white() : lv_color_black();
+    if ((is_white && light_square) || (!is_white && !light_square)) {
+        piece_color = light_square ? lv_color_black() : lv_color_white();
+    }
+
+    int margin = sq / 6;
+    int body_w = sq - (margin * 2);
+    int body_h = sq - (margin * 2);
+    int x = margin;
+    int y = margin;
+
+    char p = (char)std::tolower((unsigned char)piece);
+    switch (p) {
+        case 'p':
+            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 3, piece_color);
+            draw_rect(layer, x + body_w / 4, y + body_h / 3, body_w / 2, body_h / 2, piece_color);
+            break;
+        case 'n':
+            draw_rect(layer, x + body_w / 4, y + body_h / 4, body_w / 2, body_h / 2, piece_color);
+            draw_rect(layer, x + body_w / 2, y, body_w / 3, body_h / 3, piece_color);
+            break;
+        case 'b':
+            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 2, piece_color);
+            draw_rect(layer, x + body_w / 4, y + body_h / 2, body_w / 2, body_h / 3, piece_color);
+            break;
+        case 'r':
+            draw_rect(layer, x + body_w / 5, y, body_w / 5, body_h / 4, piece_color);
+            draw_rect(layer, x + body_w * 3 / 5, y, body_w / 5, body_h / 4, piece_color);
+            draw_rect(layer, x + body_w / 5, y + body_h / 4, body_w * 3 / 5, body_h / 2, piece_color);
+            break;
+        case 'q':
+            draw_rect(layer, x + body_w / 6, y + body_h / 4, body_w * 2 / 3, body_h / 2, piece_color);
+            draw_rect(layer, x + body_w / 5, y, body_w / 6, body_h / 4, piece_color);
+            draw_rect(layer, x + body_w * 2 / 5, y, body_w / 6, body_h / 4, piece_color);
+            draw_rect(layer, x + body_w * 3 / 5, y, body_w / 6, body_h / 4, piece_color);
+            break;
+        case 'k':
+            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 5, piece_color);
+            draw_rect(layer, x + body_w / 2 - 1, y - 2, 2, body_h / 3, piece_color);
+            draw_rect(layer, x + body_w / 5, y + body_h / 4, body_w * 3 / 5, body_h / 2, piece_color);
+            break;
+        default:
+            draw_rect(layer, x + body_w / 4, y + body_h / 4, body_w / 2, body_h / 2, piece_color);
+            break;
+    }
 }
 
 static void render_board_ui(const BoardState &board,
@@ -615,11 +717,11 @@ static void render_board_ui(const BoardState &board,
 
             lv_obj_set_style_bg_color(s_square_obj[r][c], sq_color, 0);
             if (valid) {
-                lv_label_set_text(s_piece_label[r][c], piece_to_glyph_utf8(board.board[r][c]));
+                lv_obj_clean(s_piece_layer[r][c]);
+                draw_piece_bitmap(s_piece_layer[r][c], board.board[r][c], lv_obj_get_width(s_square_obj[r][c]), light);
             } else {
-                lv_label_set_text(s_piece_label[r][c], "");
+                lv_obj_clean(s_piece_layer[r][c]);
             }
-            lv_obj_center(s_piece_label[r][c]);
         }
     }
 
@@ -865,10 +967,11 @@ static void chess_refresh_task(void *arg)
 static void create_chess_ui(lv_obj_t *screen, int board_top_y)
 {
     const int PADDING_LEFT = 16;
-    const int BOARD_SIZE = 168;
+    const int SQUARE_SIZE = 21;
+    const int BOARD_SIZE = SQUARE_SIZE * 8;
     const int BODY_GAP = 16;
     const int DETAILS_X = PADDING_LEFT + BOARD_SIZE + BODY_GAP;
-    const int square = BOARD_SIZE / 8;
+    const int square = SQUARE_SIZE;
 
     lv_obj_t *board_container = lv_obj_create(screen);
     lv_obj_set_size(board_container, BOARD_SIZE, BOARD_SIZE);
@@ -887,12 +990,14 @@ static void create_chess_ui(lv_obj_t *screen, int board_top_y)
             lv_obj_set_style_border_width(s_square_obj[r][c], 0, 0);
             lv_obj_set_style_radius(s_square_obj[r][c], 0, 0);
             lv_obj_set_style_pad_all(s_square_obj[r][c], 0, 0);
-
-            s_piece_label[r][c] = lv_label_create(s_square_obj[r][c]);
-            lv_obj_set_style_text_font(s_piece_label[r][c], chess_piece_font(), 0);
-            lv_obj_set_style_text_color(s_piece_label[r][c], lv_color_black(), 0);
-            lv_label_set_text(s_piece_label[r][c], "");
-            lv_obj_center(s_piece_label[r][c]);
+            lv_obj_set_style_bg_color(s_square_obj[r][c], lv_color_white(), 0);
+            s_piece_layer[r][c] = lv_obj_create(s_square_obj[r][c]);
+            lv_obj_set_size(s_piece_layer[r][c], square, square);
+            lv_obj_set_pos(s_piece_layer[r][c], 0, 0);
+            lv_obj_set_style_bg_opa(s_piece_layer[r][c], LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(s_piece_layer[r][c], 0, 0);
+            lv_obj_set_style_radius(s_piece_layer[r][c], 0, 0);
+            lv_obj_set_style_pad_all(s_piece_layer[r][c], 0, 0);
         }
     }
 
@@ -996,7 +1101,7 @@ extern "C" void app_main(void)
 
         const int DIVIDER_WIDTH = 368;
         const int DIVIDER_HEIGHT = 4;
-        int line_y = PADDING_TOP + 24 + HEADER_GAP + 24 + 8;
+        int line_y = PADDING_TOP + 24 + HEADER_GAP + 24 + 12;
         lv_obj_t *line = lv_obj_create(screen);
         lv_obj_set_size(line, DIVIDER_WIDTH, DIVIDER_HEIGHT);
         lv_obj_align(line, LV_ALIGN_TOP_LEFT, PADDING_LEFT, line_y);
@@ -1010,7 +1115,7 @@ extern "C" void app_main(void)
         lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_24, 0);
         lv_obj_align(s_time_label, LV_ALIGN_TOP_RIGHT, -16, PADDING_TOP);
 
-        create_chess_ui(screen, line_y + DIVIDER_HEIGHT + 8);
+        create_chess_ui(screen, line_y + DIVIDER_HEIGHT + 16);
         Lvgl_unlock();
     }
 
