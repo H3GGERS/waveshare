@@ -117,6 +117,7 @@ struct ChessState {
     std::vector<ChessGameSummary> games;
     BoardState board = {};
     bool board_valid = false;
+    bool flip_for_black = false;
     std::string status_text = "Loading...";
     std::string game_text = "";
     std::string last_move_text = "";
@@ -827,6 +828,7 @@ static chess_sprite_id_t sprite_for_piece(char piece, bool light_square)
 
 static void render_board_ui(const BoardState &board,
                             bool valid,
+                            bool flip_for_black,
                             const char *status,
                             const char *game_text,
                             const char *last_move_text,
@@ -838,10 +840,12 @@ static void render_board_ui(const BoardState &board,
 
     for (int r = 0; r < 8; r++) {
         for (int c = 0; c < 8; c++) {
-            bool light = ((r + c) % 2 == 0);
+            const int br = flip_for_black ? (7 - r) : r;
+            const int bc = flip_for_black ? (7 - c) : c;
+            bool light = ((br + bc) % 2 == 0);
             chess_sprite_id_t sprite = light ? CHESS_SPRITE_EMPTY_LIGHT : CHESS_SPRITE_EMPTY_DARK;
             if (valid) {
-                sprite = sprite_for_piece(board.board[r][c], light);
+                sprite = sprite_for_piece(board.board[br][bc], light);
             }
 
             if (!s_piece_image[r][c]) {
@@ -853,8 +857,8 @@ static void render_board_ui(const BoardState &board,
             }
 
             bool is_last_move_square = valid && board.last_move.valid &&
-                ((board.last_move.from_rank == r && board.last_move.from_file == c) ||
-                 (board.last_move.to_rank == r && board.last_move.to_file == c));
+                ((board.last_move.from_rank == br && board.last_move.from_file == bc) ||
+                 (board.last_move.to_rank == br && board.last_move.to_file == bc));
             lv_obj_set_style_border_width(s_square_obj[r][c], is_last_move_square ? 2 : 0, 0);
             if (is_last_move_square) {
                 lv_obj_set_style_border_color(s_square_obj[r][c], light ? lv_color_black() : lv_color_white(), 0);
@@ -949,14 +953,17 @@ static bool refresh_chess_state(void)
     for (char &ch : black_lower) ch = (char)std::tolower((unsigned char)ch);
 
     std::string opponent = selected_game->black;
+    bool user_is_black = false;
     if (user_lower == black_lower) {
         opponent = selected_game->white;
+        user_is_black = true;
     }
 
     xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
     s_chess_state.selected_url = selected;
     s_chess_state.board = board;
     s_chess_state.board_valid = true;
+    s_chess_state.flip_for_black = user_is_black;
     s_chess_state.status_text = selected_game->white + " vs " + selected_game->black;
     s_chess_state.game_text = "VS " + opponent;
     s_chess_state.last_move_text = last_san;
@@ -1143,12 +1150,13 @@ static void chess_refresh_task(void *arg)
         xSemaphoreTake(s_chess_mutex, portMAX_DELAY);
         BoardState board = s_chess_state.board;
         bool valid = s_chess_state.board_valid;
+        bool flip_for_black = s_chess_state.flip_for_black;
         std::string status = s_chess_state.status_text;
         std::string game = s_chess_state.game_text;
         std::string last_move = s_chess_state.last_move_text;
         std::string advantage = s_chess_state.advantage_text;
         xSemaphoreGive(s_chess_mutex);
-        render_board_ui(board, valid, status.c_str(), game.c_str(), last_move.c_str(), advantage.c_str());
+        render_board_ui(board, valid, flip_for_black, status.c_str(), game.c_str(), last_move.c_str(), advantage.c_str());
         ulTaskNotifyTake(pdTRUE, interval);
     }
 }
