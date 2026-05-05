@@ -1,0 +1,47 @@
+#pragma once
+
+#include <stdint.h>
+#include "lvgl.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define CHESS_SPRITE_TILE_SIZE 30
+#define CHESS_SPRITE_TILE_BYTES (30 * 30 * 2)
+
+typedef enum {
+    CHESS_SPRITE_WK_LIGHT,
+    CHESS_SPRITE_WK_DARK,
+    CHESS_SPRITE_BK_LIGHT,
+    CHESS_SPRITE_BK_DARK,
+    CHESS_SPRITE_WQ_LIGHT,
+    CHESS_SPRITE_WQ_DARK,
+    CHESS_SPRITE_BQ_LIGHT,
+    CHESS_SPRITE_BQ_DARK,
+    CHESS_SPRITE_WB_LIGHT,
+    CHESS_SPRITE_WB_DARK,
+    CHESS_SPRITE_BB_LIGHT,
+    CHESS_SPRITE_BB_DARK,
+    CHESS_SPRITE_WN_LIGHT,
+    CHESS_SPRITE_WN_DARK,
+    CHESS_SPRITE_BN_LIGHT,
+    CHESS_SPRITE_BN_DARK,
+    CHESS_SPRITE_WR_LIGHT,
+    CHESS_SPRITE_WR_DARK,
+    CHESS_SPRITE_BR_LIGHT,
+    CHESS_SPRITE_BR_DARK,
+    CHESS_SPRITE_WP_LIGHT,
+    CHESS_SPRITE_WP_DARK,
+    CHESS_SPRITE_BP_LIGHT,
+    CHESS_SPRITE_BP_DARK,
+    CHESS_SPRITE_EMPTY_LIGHT,
+    CHESS_SPRITE_EMPTY_DARK,
+    CHESS_SPRITE_COUNT
+} chess_sprite_id_t;
+
+const lv_image_dsc_t *chess_sprite_get(chess_sprite_id_t id);
+
+#ifdef __cplusplus
+}
+#endif

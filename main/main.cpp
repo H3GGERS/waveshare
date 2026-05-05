@@ -35,8 +35,12 @@
 #include "display_bsp.h"
 #include "lvgl_bsp.h"
 #include "lvgl.h"
+#include "chess_sprites/chess_sprites.h"
 
-extern const lv_font_t Inter_24pt_Bold;
+extern const lv_font_t Inter_12pt_Bold;
+extern const lv_font_t Montserrat_20pt_Medium;
+extern const lv_font_t Montserrat_20pt_Light;
+extern const lv_font_t Montserrat_16pt_Regular;
 
 static const char *TAG = "main";
 
@@ -72,7 +76,8 @@ static lv_obj_t *s_game_value_label = NULL;
 static lv_obj_t *s_last_move_value_label = NULL;
 static lv_obj_t *s_advantage_value_label = NULL;
 static lv_obj_t *s_square_obj[8][8] = {};
-static lv_obj_t *s_piece_layer[8][8] = {};
+static lv_obj_t *s_piece_image[8][8] = {};
+static chess_sprite_id_t s_current_sprite[8][8] = {};
 
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
 static adc_channel_t s_battery_channel = ADC_CHANNEL_0;
@@ -373,11 +378,7 @@ static void update_clock_cb(void *arg)
     const char *ampm = (tm.tm_hour < 12) ? "AM" : "PM";
     int batt_pct = read_battery_percent();
     char time_buf[32];
-    if (batt_pct >= 0) {
-        snprintf(time_buf, sizeof(time_buf), "%d:%02d %s | %d%%", h12, tm.tm_min, ampm, batt_pct);
-    } else {
-        snprintf(time_buf, sizeof(time_buf), "%d:%02d %s | --%%", h12, tm.tm_min, ampm);
-    }
+    snprintf(time_buf, sizeof(time_buf), "%d:%02d %s", h12, tm.tm_min, ampm);
 
     if (Lvgl_lock(50)) {
         if (s_date_label) {
@@ -752,17 +753,6 @@ static void save_selected_url_to_nvs(const std::string &url)
     nvs_close(handle);
 }
 
-static void draw_rect(lv_obj_t *parent, int x, int y, int w, int h, lv_color_t color)
-{
-    lv_obj_t *r = lv_obj_create(parent);
-    lv_obj_set_size(r, w, h);
-    lv_obj_set_pos(r, x, y);
-    lv_obj_set_style_bg_color(r, color, 0);
-    lv_obj_set_style_border_width(r, 0, 0);
-    lv_obj_set_style_radius(r, 0, 0);
-    lv_obj_set_style_pad_all(r, 0, 0);
-}
-
 static int piece_material_value(char piece)
 {
     switch ((char)std::tolower((unsigned char)piece)) {
@@ -804,56 +794,34 @@ static std::string compute_advantage_text(const BoardState &board)
     return "Black +" + std::to_string(-diff);
 }
 
-static void draw_piece_bitmap(lv_obj_t *layer, char piece, int sq, bool light_square)
+static chess_sprite_id_t sprite_for_piece(char piece, bool light_square)
 {
     if (piece == 0) {
-        return;
+        return light_square ? CHESS_SPRITE_EMPTY_LIGHT : CHESS_SPRITE_EMPTY_DARK;
     }
-    bool is_white = std::isupper((unsigned char)piece);
-    lv_color_t piece_color = is_white ? lv_color_white() : lv_color_black();
-    if ((is_white && light_square) || (!is_white && !light_square)) {
-        piece_color = light_square ? lv_color_black() : lv_color_white();
-    }
-
-    int margin = sq / 6;
-    int body_w = sq - (margin * 2);
-    int body_h = sq - (margin * 2);
-    int x = margin;
-    int y = margin;
-
+    const bool is_white = std::isupper((unsigned char)piece);
     char p = (char)std::tolower((unsigned char)piece);
     switch (p) {
-        case 'p':
-            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 3, piece_color);
-            draw_rect(layer, x + body_w / 4, y + body_h / 3, body_w / 2, body_h / 2, piece_color);
-            break;
-        case 'n':
-            draw_rect(layer, x + body_w / 4, y + body_h / 4, body_w / 2, body_h / 2, piece_color);
-            draw_rect(layer, x + body_w / 2, y, body_w / 3, body_h / 3, piece_color);
-            break;
-        case 'b':
-            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 2, piece_color);
-            draw_rect(layer, x + body_w / 4, y + body_h / 2, body_w / 2, body_h / 3, piece_color);
-            break;
-        case 'r':
-            draw_rect(layer, x + body_w / 5, y, body_w / 5, body_h / 4, piece_color);
-            draw_rect(layer, x + body_w * 3 / 5, y, body_w / 5, body_h / 4, piece_color);
-            draw_rect(layer, x + body_w / 5, y + body_h / 4, body_w * 3 / 5, body_h / 2, piece_color);
-            break;
-        case 'q':
-            draw_rect(layer, x + body_w / 6, y + body_h / 4, body_w * 2 / 3, body_h / 2, piece_color);
-            draw_rect(layer, x + body_w / 5, y, body_w / 6, body_h / 4, piece_color);
-            draw_rect(layer, x + body_w * 2 / 5, y, body_w / 6, body_h / 4, piece_color);
-            draw_rect(layer, x + body_w * 3 / 5, y, body_w / 6, body_h / 4, piece_color);
-            break;
         case 'k':
-            draw_rect(layer, x + body_w / 3, y, body_w / 3, body_h / 5, piece_color);
-            draw_rect(layer, x + body_w / 2 - 1, y - 2, 2, body_h / 3, piece_color);
-            draw_rect(layer, x + body_w / 5, y + body_h / 4, body_w * 3 / 5, body_h / 2, piece_color);
-            break;
+            if (is_white) return light_square ? CHESS_SPRITE_WK_LIGHT : CHESS_SPRITE_WK_DARK;
+            return light_square ? CHESS_SPRITE_BK_LIGHT : CHESS_SPRITE_BK_DARK;
+        case 'q':
+            if (is_white) return light_square ? CHESS_SPRITE_WQ_LIGHT : CHESS_SPRITE_WQ_DARK;
+            return light_square ? CHESS_SPRITE_BQ_LIGHT : CHESS_SPRITE_BQ_DARK;
+        case 'b':
+            if (is_white) return light_square ? CHESS_SPRITE_WB_LIGHT : CHESS_SPRITE_WB_DARK;
+            return light_square ? CHESS_SPRITE_BB_LIGHT : CHESS_SPRITE_BB_DARK;
+        case 'n':
+            if (is_white) return light_square ? CHESS_SPRITE_WN_LIGHT : CHESS_SPRITE_WN_DARK;
+            return light_square ? CHESS_SPRITE_BN_LIGHT : CHESS_SPRITE_BN_DARK;
+        case 'r':
+            if (is_white) return light_square ? CHESS_SPRITE_WR_LIGHT : CHESS_SPRITE_WR_DARK;
+            return light_square ? CHESS_SPRITE_BR_LIGHT : CHESS_SPRITE_BR_DARK;
+        case 'p':
+            if (is_white) return light_square ? CHESS_SPRITE_WP_LIGHT : CHESS_SPRITE_WP_DARK;
+            return light_square ? CHESS_SPRITE_BP_LIGHT : CHESS_SPRITE_BP_DARK;
         default:
-            draw_rect(layer, x + body_w / 4, y + body_h / 4, body_w / 2, body_h / 2, piece_color);
-            break;
+            return light_square ? CHESS_SPRITE_EMPTY_LIGHT : CHESS_SPRITE_EMPTY_DARK;
     }
 }
 
@@ -871,20 +839,25 @@ static void render_board_ui(const BoardState &board,
     for (int r = 0; r < 8; r++) {
         for (int c = 0; c < 8; c++) {
             bool light = ((r + c) % 2 == 0);
-            lv_color_t sq_color = light ? lv_color_white() : lv_color_black();
-
-            if (valid && board.last_move.valid &&
-                ((board.last_move.from_rank == r && board.last_move.from_file == c) ||
-                 (board.last_move.to_rank == r && board.last_move.to_file == c))) {
-                sq_color = light ? lv_color_make(210, 210, 210) : lv_color_make(40, 40, 40);
+            chess_sprite_id_t sprite = light ? CHESS_SPRITE_EMPTY_LIGHT : CHESS_SPRITE_EMPTY_DARK;
+            if (valid) {
+                sprite = sprite_for_piece(board.board[r][c], light);
             }
 
-            lv_obj_set_style_bg_color(s_square_obj[r][c], sq_color, 0);
-            if (valid) {
-                lv_obj_clean(s_piece_layer[r][c]);
-                draw_piece_bitmap(s_piece_layer[r][c], board.board[r][c], lv_obj_get_width(s_square_obj[r][c]), light);
-            } else {
-                lv_obj_clean(s_piece_layer[r][c]);
+            if (!s_piece_image[r][c]) {
+                continue;
+            }
+            if (s_current_sprite[r][c] != sprite) {
+                s_current_sprite[r][c] = sprite;
+                lv_image_set_src(s_piece_image[r][c], chess_sprite_get(sprite));
+            }
+
+            bool is_last_move_square = valid && board.last_move.valid &&
+                ((board.last_move.from_rank == r && board.last_move.from_file == c) ||
+                 (board.last_move.to_rank == r && board.last_move.to_file == c));
+            lv_obj_set_style_border_width(s_square_obj[r][c], is_last_move_square ? 2 : 0, 0);
+            if (is_last_move_square) {
+                lv_obj_set_style_border_color(s_square_obj[r][c], light ? lv_color_black() : lv_color_white(), 0);
             }
         }
     }
@@ -1180,18 +1153,25 @@ static void chess_refresh_task(void *arg)
     }
 }
 
-static void create_chess_ui(lv_obj_t *screen, int board_top_y)
+static void create_chess_ui(lv_obj_t *content)
 {
-    const int PADDING_LEFT = 16;
-    const int SQUARE_SIZE = 21;
+    const int SQUARE_SIZE = CHESS_SPRITE_TILE_SIZE;
     const int BOARD_SIZE = SQUARE_SIZE * 8;
     const int BODY_GAP = 16;
-    const int DETAILS_X = PADDING_LEFT + BOARD_SIZE + BODY_GAP;
-    const int square = SQUARE_SIZE;
+    const int DETAILS_W = LCD_WIDTH - (12 * 2) - BOARD_SIZE - BODY_GAP;
 
-    lv_obj_t *board_container = lv_obj_create(screen);
-    lv_obj_set_size(board_container, BOARD_SIZE, BOARD_SIZE);
-    lv_obj_set_pos(board_container, PADDING_LEFT, board_top_y);
+    lv_obj_t *body = lv_obj_create(content);
+    lv_obj_set_size(body, lv_pct(100), BOARD_SIZE + 4);
+    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(body, 0, 0);
+    lv_obj_set_style_pad_all(body, 0, 0);
+    lv_obj_set_style_pad_column(body, BODY_GAP, 0);
+    lv_obj_set_style_radius(body, 0, 0);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(body, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+
+    lv_obj_t *board_container = lv_obj_create(body);
+    lv_obj_set_size(board_container, BOARD_SIZE + 4, BOARD_SIZE + 4);
     lv_obj_set_style_bg_opa(board_container, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(board_container, 2, 0);
     lv_obj_set_style_border_color(board_container, lv_color_black(), 0);
@@ -1201,61 +1181,69 @@ static void create_chess_ui(lv_obj_t *screen, int board_top_y)
     for (int r = 0; r < 8; r++) {
         for (int c = 0; c < 8; c++) {
             s_square_obj[r][c] = lv_obj_create(board_container);
-            lv_obj_set_size(s_square_obj[r][c], square, square);
-            lv_obj_set_pos(s_square_obj[r][c], c * square, r * square);
+            lv_obj_set_size(s_square_obj[r][c], SQUARE_SIZE, SQUARE_SIZE);
+            lv_obj_set_pos(s_square_obj[r][c], 2 + (c * SQUARE_SIZE), 2 + (r * SQUARE_SIZE));
             lv_obj_set_style_border_width(s_square_obj[r][c], 0, 0);
             lv_obj_set_style_radius(s_square_obj[r][c], 0, 0);
             lv_obj_set_style_pad_all(s_square_obj[r][c], 0, 0);
             lv_obj_set_style_bg_color(s_square_obj[r][c], lv_color_white(), 0);
-            s_piece_layer[r][c] = lv_obj_create(s_square_obj[r][c]);
-            lv_obj_set_size(s_piece_layer[r][c], square, square);
-            lv_obj_set_pos(s_piece_layer[r][c], 0, 0);
-            lv_obj_set_style_bg_opa(s_piece_layer[r][c], LV_OPA_TRANSP, 0);
-            lv_obj_set_style_border_width(s_piece_layer[r][c], 0, 0);
-            lv_obj_set_style_radius(s_piece_layer[r][c], 0, 0);
-            lv_obj_set_style_pad_all(s_piece_layer[r][c], 0, 0);
+
+            s_piece_image[r][c] = lv_image_create(s_square_obj[r][c]);
+            lv_obj_set_size(s_piece_image[r][c], SQUARE_SIZE, SQUARE_SIZE);
+            lv_obj_center(s_piece_image[r][c]);
+            s_current_sprite[r][c] = CHESS_SPRITE_COUNT;
+            chess_sprite_id_t initial = ((r + c) % 2 == 0) ? CHESS_SPRITE_EMPTY_LIGHT : CHESS_SPRITE_EMPTY_DARK;
+            lv_image_set_src(s_piece_image[r][c], chess_sprite_get(initial));
+            s_current_sprite[r][c] = initial;
         }
     }
 
-    lv_obj_t *title_game = lv_label_create(screen);
-    lv_obj_set_style_text_font(title_game, &Inter_24pt_Bold, 0);
+    lv_obj_t *details = lv_obj_create(body);
+    lv_obj_set_size(details, DETAILS_W, BOARD_SIZE);
+    lv_obj_set_style_bg_opa(details, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(details, 0, 0);
+    lv_obj_set_style_pad_top(details, 8, 0);
+    lv_obj_set_style_pad_bottom(details, 8, 0);
+    lv_obj_set_style_pad_left(details, 0, 0);
+    lv_obj_set_style_pad_right(details, 0, 0);
+    lv_obj_set_style_pad_row(details, 16, 0);
+    lv_obj_set_style_radius(details, 0, 0);
+    lv_obj_set_flex_flow(details, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(details, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    lv_obj_t *title_game = lv_label_create(details);
+    lv_obj_set_style_text_font(title_game, &Inter_12pt_Bold, 0);
     lv_obj_set_style_text_color(title_game, lv_color_black(), 0);
-    lv_obj_set_pos(title_game, DETAILS_X, board_top_y + 0);
     lv_label_set_text(title_game, "Game");
 
-    s_game_value_label = lv_label_create(screen);
-    lv_obj_set_style_text_font(s_game_value_label, &lv_font_montserrat_24, 0);
+    s_game_value_label = lv_label_create(details);
+    lv_obj_set_style_text_font(s_game_value_label, &Montserrat_16pt_Regular, 0);
     lv_obj_set_style_text_color(s_game_value_label, lv_color_black(), 0);
-    lv_obj_set_pos(s_game_value_label, DETAILS_X, board_top_y + 24);
     lv_label_set_text(s_game_value_label, "VS --");
 
-    lv_obj_t *title_move = lv_label_create(screen);
-    lv_obj_set_style_text_font(title_move, &Inter_24pt_Bold, 0);
+    lv_obj_t *title_move = lv_label_create(details);
+    lv_obj_set_style_text_font(title_move, &Inter_12pt_Bold, 0);
     lv_obj_set_style_text_color(title_move, lv_color_black(), 0);
-    lv_obj_set_pos(title_move, DETAILS_X, board_top_y + 54);
     lv_label_set_text(title_move, "Last Move");
 
-    s_last_move_value_label = lv_label_create(screen);
-    lv_obj_set_style_text_font(s_last_move_value_label, &lv_font_montserrat_24, 0);
+    s_last_move_value_label = lv_label_create(details);
+    lv_obj_set_style_text_font(s_last_move_value_label, &Montserrat_16pt_Regular, 0);
     lv_obj_set_style_text_color(s_last_move_value_label, lv_color_black(), 0);
-    lv_obj_set_pos(s_last_move_value_label, DETAILS_X, board_top_y + 78);
     lv_label_set_text(s_last_move_value_label, "--");
 
-    lv_obj_t *title_adv = lv_label_create(screen);
-    lv_obj_set_style_text_font(title_adv, &Inter_24pt_Bold, 0);
+    lv_obj_t *title_adv = lv_label_create(details);
+    lv_obj_set_style_text_font(title_adv, &Inter_12pt_Bold, 0);
     lv_obj_set_style_text_color(title_adv, lv_color_black(), 0);
-    lv_obj_set_pos(title_adv, DETAILS_X, board_top_y + 108);
     lv_label_set_text(title_adv, "Advantage");
 
-    s_advantage_value_label = lv_label_create(screen);
-    lv_obj_set_style_text_font(s_advantage_value_label, &lv_font_montserrat_24, 0);
+    s_advantage_value_label = lv_label_create(details);
+    lv_obj_set_style_text_font(s_advantage_value_label, &Montserrat_16pt_Regular, 0);
     lv_obj_set_style_text_color(s_advantage_value_label, lv_color_black(), 0);
-    lv_obj_set_pos(s_advantage_value_label, DETAILS_X, board_top_y + 132);
     lv_label_set_text(s_advantage_value_label, "Unknown");
 
     // Status retained for diagnostics, kept hidden from layout.
-    s_status_label = lv_label_create(screen);
-    lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_24, 0);
+    s_status_label = lv_label_create(content);
+    lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_pos(s_status_label, LCD_WIDTH + 8, LCD_HEIGHT + 8);
     lv_label_set_text(s_status_label, "");
 }
@@ -1310,37 +1298,36 @@ extern "C" void app_main(void)
 
     if (Lvgl_lock(-1)) {
         lv_obj_t *screen = lv_screen_active();
-        const int PADDING_LEFT = 16;
-        const int PADDING_TOP = 16;
-        const int HEADER_GAP = 8;
+        lv_obj_t *content = lv_obj_create(screen);
+        lv_obj_set_size(content, LCD_WIDTH, LCD_HEIGHT);
+        lv_obj_center(content);
+        lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(content, 0, 0);
+        lv_obj_set_style_pad_all(content, 12, 0);
+        lv_obj_set_style_pad_row(content, 8, 0);
+        lv_obj_set_style_radius(content, 0, 0);
+        lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-        lv_obj_t *greeting = lv_label_create(screen);
-        lv_label_set_text(greeting, "Hello Kyle");
-        lv_obj_set_style_text_font(greeting, &Inter_24pt_Bold, 0);
-        lv_obj_align(greeting, LV_ALIGN_TOP_LEFT, PADDING_LEFT, PADDING_TOP);
+        lv_obj_t *top = lv_obj_create(content);
+        lv_obj_set_width(top, lv_pct(100));
+        lv_obj_set_height(top, 30);
+        lv_obj_set_style_bg_opa(top, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(top, 0, 0);
+        lv_obj_set_style_pad_all(top, 0, 0);
+        lv_obj_set_style_radius(top, 0, 0);
+        lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(top, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-        s_date_label = lv_label_create(screen);
+        s_date_label = lv_label_create(top);
         lv_label_set_text(s_date_label, "Its ...");
-        lv_obj_set_style_text_font(s_date_label, &Inter_24pt_Bold, 0);
-        lv_obj_align_to(s_date_label, greeting, LV_ALIGN_OUT_BOTTOM_LEFT, 0, HEADER_GAP);
+        lv_obj_set_style_text_font(s_date_label, &Montserrat_20pt_Medium, 0);
 
-        const int DIVIDER_WIDTH = 368;
-        const int DIVIDER_HEIGHT = 4;
-        int line_y = PADDING_TOP + 24 + HEADER_GAP + 24 + 12;
-        lv_obj_t *line = lv_obj_create(screen);
-        lv_obj_set_size(line, DIVIDER_WIDTH, DIVIDER_HEIGHT);
-        lv_obj_align(line, LV_ALIGN_TOP_LEFT, PADDING_LEFT, line_y);
-        lv_obj_set_style_bg_color(line, lv_color_black(), 0);
-        lv_obj_set_style_radius(line, 0, 0);
-        lv_obj_set_style_pad_all(line, 0, 0);
-        lv_obj_set_style_border_width(line, 0, 0);
+        s_time_label = lv_label_create(top);
+        lv_label_set_text(s_time_label, "10:53 AM");
+        lv_obj_set_style_text_font(s_time_label, &Montserrat_20pt_Light, 0);
 
-        s_time_label = lv_label_create(screen);
-        lv_label_set_text(s_time_label, "10:53 AM | --%");
-        lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_24, 0);
-        lv_obj_align(s_time_label, LV_ALIGN_TOP_RIGHT, -16, PADDING_TOP);
-
-        create_chess_ui(screen, line_y + DIVIDER_HEIGHT + 16);
+        create_chess_ui(content);
         Lvgl_unlock();
     }
 

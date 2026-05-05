@@ -1,6 +1,10 @@
 set(MAIN_SRCS
     "main.cpp"
-    "fonts/Inter_24pt_Bold.c"
+    "chess_sprites/chess_sprites.c"
+    "fonts/Inter_12pt_Bold.c"
+    "fonts/Montserrat_20pt_Medium.c"
+    "fonts/Montserrat_20pt_Light.c"
+    "fonts/Montserrat_16pt_Regular.c"
     "fonts/NotoSansSymbols2_24.c"
 )
 

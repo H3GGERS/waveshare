@@ -78,3 +78,32 @@ Notes:
 - Board state comes from Chess.com FEN data.
 - Last-move highlight is best-effort (if a coordinate-style move token is present in PGN text).
 - If Chess.com is unreachable, the last rendered board stays on screen and status text updates.
+
+### Chess sprite pipeline (Figma -> firmware)
+
+Board squares are rendered from prebuilt sprite tiles (piece + square baked together) for crisp, deterministic output on this monochrome panel.
+
+Export spec:
+- 26 tiles total in this order: white/black king, queen, bishop, knight, rook, pawn (each on light and dark), then empty light/dark.
+- Tile size target: use native export size (`30x30` currently).
+- Use pure black/white in Figma and snap shapes to whole pixels.
+- Export individual PNGs into `chess_pieces/` using Figma's variant naming.
+
+Generate C assets:
+
+```powershell
+python tools/generate_chess_sprites.py `
+  --source-dir "chess_pieces" `
+  --out-dir "main/chess_sprites" `
+  --threshold 128 `
+  --renamed-png-dir "chess_pieces/normalized"
+```
+
+Optional: pass `--tile-size <n>` only if you intentionally want resampling.
+
+The generator emits:
+- `main/chess_sprites/chess_sprites.h`
+- `main/chess_sprites/chess_sprites.c`
+- Optional normalized filenames like `wk_light.png`, `bp_dark.png` under `chess_pieces/normalized`.
+
+These are compiled into firmware and selected per square at runtime.
