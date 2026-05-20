@@ -378,8 +378,12 @@ static void update_clock_cb(void *arg)
     }
     const char *ampm = (tm.tm_hour < 12) ? "AM" : "PM";
     int batt_pct = read_battery_percent();
-    char time_buf[32];
-    snprintf(time_buf, sizeof(time_buf), "%d:%02d %s", h12, tm.tm_min, ampm);
+    char time_buf[40];
+    if (batt_pct >= 0) {
+        snprintf(time_buf, sizeof(time_buf), "%d:%02d %s | %d%%", h12, tm.tm_min, ampm, batt_pct);
+    } else {
+        snprintf(time_buf, sizeof(time_buf), "%d:%02d %s | --%%", h12, tm.tm_min, ampm);
+    }
 
     if (Lvgl_lock(50)) {
         if (s_date_label) {
